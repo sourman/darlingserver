@@ -7,9 +7,13 @@
 
 #include <kern/zalloc.h>
 #include <kern/kalloc.h>
+#include <kern/ipc_kobject.h>
 #include <vm/vm_kern.h>
+#include <vm/vm_map.h>
+#include <mach/memory_object_types.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <mach_debug/mach_debug.h>
 
@@ -23,8 +27,12 @@ struct kalloc_heap KHEAP_DEFAULT[1];
 // stub
 struct kalloc_heap KHEAP_DATA_BUFFERS[1];
 
-// stub
-vm_size_t kalloc_max_prerounded = 0;
+// Empty PHYSICAL_COPY OOL (IOServiceOpen propertiesCnt=0) must not take the
+// "large physical copy" path. XNU sets this from the kalloc heap; a zero
+// value makes MSG_OOL_SIZE_SMALL=0, so size 0 is treated as a large copy and
+// the wrap check `space_needed + round_page(0) <= space_needed` returns
+// MACH_MSG_VM_KERNEL (0x400). Match MSG_OOL_SIZE_SMALL_MAX (2*PAGE_SIZE).
+vm_size_t kalloc_max_prerounded = 8192;
 
 void* calloc(size_t count, size_t size);
 void* aligned_alloc(size_t alignment, size_t size);
@@ -41,6 +49,8 @@ int ftruncate(int fd, off_t length);
 #define MAP_ANONYMOUS 0x20
 #define MAP_SHARED 0x01
 #define MAP_PRIVATE 0x02
+#define MAP_FIXED 0x10
+#define MAP_FIXED_NOREPLACE 0x100000
 
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
@@ -152,6 +162,189 @@ static void dtape_map_insert_shared_entry(dtape_map_t* map, dtape_map_shared_ent
 	dtape_mutex_lock(&map->shared_entry_lock);
 	dtape_map_insert_shared_entry_locked(map, shared_entry);
 	dtape_mutex_unlock(&map->shared_entry_lock);
+};
+
+static uint64_t dtape_page_size(void) {
+	long page_size = sysconf(_SC_PAGESIZE);
+	if (page_size <= 0) {
+		return 4096;
+	}
+	return (uint64_t)page_size;
+};
+
+static uint64_t dtape_round_page(uint64_t size) {
+	uint64_t page_size = dtape_page_size();
+	return (size + page_size - 1) & ~(page_size - 1);
+};
+
+static kern_return_t dtape_task_unmap_bytes(vm_map_t map, uintptr_t addr, uint64_t size) {
+	if (size == 0) {
+		return KERN_SUCCESS;
+	}
+
+	if (map == kernel_map) {
+		if (munmap((void*)addr, (size_t)size) < 0) {
+			return KERN_FAILURE;
+		}
+		return KERN_SUCCESS;
+	}
+
+	if (dtape_hooks->task_free_pages(map->dtape_task->context, addr, dtape_byte_count_to_page_count_round_down(size)) < 0) {
+		return KERN_FAILURE;
+	}
+	return KERN_SUCCESS;
+};
+
+static uintptr_t dtape_task_map_memfd(vm_map_t map, int memfd, uint64_t size, int prot, uintptr_t hint, uint64_t byte_offset, dtape_memory_flags_t memflags) {
+	size_t page_count;
+	size_t page_offset;
+
+	if (size == 0) {
+		return 0;
+	}
+
+	page_count = dtape_byte_count_to_page_count_round_up(size);
+	page_offset = dtape_byte_count_to_page_count_round_down(byte_offset);
+
+	if (map == kernel_map) {
+		int linux_flags = MAP_SHARED;
+		void* mapped;
+
+		if ((memflags & dtape_memory_flag_fixed) && (memflags & dtape_memory_flag_overwrite)) {
+			linux_flags |= MAP_FIXED;
+		} else if (memflags & dtape_memory_flag_fixed) {
+			linux_flags |= MAP_FIXED_NOREPLACE;
+		}
+
+		mapped = mmap((void*)hint, (size_t)size, prot, linux_flags, memfd, (long int)byte_offset);
+		if (mapped == MAP_FAILED) {
+			return 0;
+		}
+		return (uintptr_t)mapped;
+	}
+
+	return dtape_hooks->task_map_file(map->dtape_task->context, memfd, page_count, prot, hint, page_offset, memflags);
+};
+
+static uintptr_t dtape_task_reserve_anonymous(vm_map_t map, uint64_t size, int prot, uintptr_t hint) {
+	if (map == kernel_map) {
+		void* mapped = mmap((void*)hint, (size_t)size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (mapped == MAP_FAILED) {
+			return 0;
+		}
+		return (uintptr_t)mapped;
+	}
+
+	return dtape_hooks->task_allocate_pages(map->dtape_task->context, dtape_byte_count_to_page_count_round_up(size), prot, hint, dtape_memory_flag_none);
+};
+
+/*
+ * Map a named-entry memfd like XNU: honor ANYWHERE as a hint (never Linux MAP_FIXED
+ * unless OVERWRITE), then copy the trap's over-map/trim for mask alignment without
+ * shifting the memfd page offset.
+ */
+static kern_return_t dtape_map_memfd_aligned(vm_map_t map, int memfd, uint64_t size, int prot, uintptr_t hint, uint64_t byte_offset, mach_vm_offset_t mask, dtape_memory_flags_t memflags, uintptr_t* out_addr) {
+	uintptr_t addr;
+	uintptr_t iaddr;
+	uintptr_t boundary;
+	uintptr_t q;
+	uintptr_t diff;
+	uint64_t over_size;
+
+	addr = dtape_task_map_memfd(map, memfd, size, prot, hint, byte_offset, memflags);
+	if (!addr) {
+		return KERN_NO_SPACE;
+	}
+
+	if (mask == 0 || (addr & mask) == 0) {
+		*out_addr = addr;
+		return KERN_SUCCESS;
+	}
+
+	if (memflags & dtape_memory_flag_fixed) {
+		/*
+		 * FIXED maps must land at the requested address. Over-mapping would
+		 * extend past that range; leave the mapping if the caller asked for it.
+		 */
+		*out_addr = addr;
+		return KERN_SUCCESS;
+	}
+
+	dtape_task_unmap_bytes(map, addr, size);
+
+	boundary = (uintptr_t)mask + 1;
+	over_size = size + boundary;
+
+	iaddr = dtape_task_reserve_anonymous(map, over_size, prot, hint);
+	if (!iaddr) {
+		return KERN_NO_SPACE;
+	}
+
+	q = (iaddr + (boundary - 1)) / boundary * boundary;
+	diff = q - iaddr;
+
+	addr = dtape_task_map_memfd(map, memfd, size, prot, q, byte_offset, dtape_memory_flag_fixed | dtape_memory_flag_overwrite);
+	if (!addr) {
+		dtape_task_unmap_bytes(map, iaddr, over_size);
+		return KERN_NO_SPACE;
+	}
+
+	if (diff > 0) {
+		dtape_task_unmap_bytes(map, iaddr, diff);
+	}
+	if (boundary - diff > 0) {
+		dtape_task_unmap_bytes(map, q + size, boundary - diff);
+	}
+
+	*out_addr = addr;
+	return KERN_SUCCESS;
+};
+
+static kern_return_t dtape_named_copy_attach_memfd(vm_map_copy_t copy, uint64_t map_size) {
+	int memfd;
+	void* mapped = NULL;
+	dtape_map_shared_descriptor_t* desc;
+	uint64_t backing_size = map_size;
+
+	if (copy == NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	if (backing_size < copy->size) {
+		backing_size = copy->size;
+	}
+	backing_size = dtape_round_page(backing_size);
+
+	memfd = memfd_create("darling-named-entry", MFD_CLOEXEC);
+	if (memfd < 0) {
+		return KERN_RESOURCE_SHORTAGE;
+	}
+
+	if (backing_size > 0 && ftruncate(memfd, (off_t)backing_size) < 0) {
+		close(memfd);
+		return KERN_RESOURCE_SHORTAGE;
+	}
+
+	if (copy->cpy_kdata && copy->size > 0) {
+		mapped = mmap(NULL, (size_t)backing_size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+		if (mapped == MAP_FAILED) {
+			close(memfd);
+			return KERN_RESOURCE_SHORTAGE;
+		}
+		memcpy(mapped, copy->cpy_kdata, (size_t)copy->size);
+		if (munmap(mapped, (size_t)backing_size) < 0) {
+			dtape_log_error("failed to unmap named-entry memfd staging mapping");
+		}
+	}
+
+	desc = dtape_map_shared_descriptor_create(memfd, backing_size);
+	if (!desc) {
+		close(memfd);
+		return KERN_RESOURCE_SHORTAGE;
+	}
+
+	copy->dtape_descriptor = desc;
+	return KERN_SUCCESS;
 };
 
 /**
@@ -386,6 +579,10 @@ void vm_map_copy_discard(vm_map_copy_t copy) {
 	if (copy == VM_MAP_COPY_NULL) {
 		return;
 	}
+	if (copy->dtape_descriptor) {
+		dtape_map_shared_descriptor_release(copy->dtape_descriptor);
+		copy->dtape_descriptor = NULL;
+	}
 	free(copy);
 };
 
@@ -406,6 +603,7 @@ kern_return_t vm_map_copyin_common(vm_map_t src_map, vm_map_address_t src_addr, 
 	copy->size = len;
 	copy->offset = 0;
 	copy->cpy_kdata = copy->dtape_copy_data;
+	copy->dtape_descriptor = NULL;
 
 	kr = copyinmap(src_map, src_addr, copy->cpy_kdata, (vm_size_t)len);
 	if (kr != KERN_SUCCESS) {
@@ -527,7 +725,86 @@ kern_return_t mach_vm_allocate_kernel(vm_map_t map, mach_vm_offset_t* addr, mach
 };
 
 kern_return_t _mach_make_memory_entry(vm_map_t target_map, memory_object_size_t* size, memory_object_offset_t offset, vm_prot_t permission, ipc_port_t* object_handle, ipc_port_t parent_entry) {
-	dtape_stub_unsafe();
+	vm_named_entry_t user_entry;
+	ipc_port_t user_handle;
+	vm_map_copy_t copy = VM_MAP_COPY_NULL;
+	memory_object_size_t requested;
+	vm_map_size_t map_size;
+	long page_size;
+
+	(void)parent_entry;
+
+	if (size == NULL || object_handle == NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	requested = *size;
+	page_size = sysconf(_SC_PAGESIZE);
+	if (page_size <= 0) {
+		return KERN_FAILURE;
+	}
+
+	map_size = (requested + (memory_object_size_t)(page_size - 1)) & ~((memory_object_size_t)page_size - 1);
+
+	user_entry = (vm_named_entry_t) kalloc(sizeof(*user_entry));
+	if (user_entry == NULL) {
+		return KERN_FAILURE;
+	}
+	memset(user_entry, 0, sizeof(*user_entry));
+	named_entry_lock_init(user_entry);
+
+	if ((permission & MAP_MEM_NAMED_CREATE) || requested == 0 || target_map == VM_MAP_NULL) {
+		copy = malloc(sizeof(struct vm_map_copy));
+		if (copy == NULL) {
+			named_entry_lock_destroy(user_entry);
+			kfree(user_entry, sizeof(*user_entry));
+			return KERN_RESOURCE_SHORTAGE;
+		}
+		memset(copy, 0, sizeof(struct vm_map_copy));
+		copy->type = VM_MAP_COPY_KERNEL_BUFFER;
+		copy->size = map_size;
+		copy->offset = 0;
+		copy->cpy_kdata = NULL;
+		if (dtape_named_copy_attach_memfd(copy, map_size) != KERN_SUCCESS) {
+			free(copy);
+			named_entry_lock_destroy(user_entry);
+			kfree(user_entry, sizeof(*user_entry));
+			return KERN_RESOURCE_SHORTAGE;
+		}
+	} else {
+		kern_return_t kr = vm_map_copyin_common(target_map, offset, requested, FALSE, FALSE, &copy, FALSE);
+		if (kr != KERN_SUCCESS) {
+			named_entry_lock_destroy(user_entry);
+			kfree(user_entry, sizeof(*user_entry));
+			return kr;
+		}
+		map_size = copy->size;
+		kr = dtape_named_copy_attach_memfd(copy, map_size);
+		if (kr != KERN_SUCCESS) {
+			vm_map_copy_discard(copy);
+			named_entry_lock_destroy(user_entry);
+			kfree(user_entry, sizeof(*user_entry));
+			return kr;
+		}
+	}
+
+	user_entry->backing.copy = copy;
+	user_entry->is_object = FALSE;
+	user_entry->is_sub_map = FALSE;
+	user_entry->is_copy = TRUE;
+	user_entry->internal = TRUE;
+	user_entry->size = map_size;
+	user_entry->offset = 0;
+	user_entry->data_offset = 0;
+	user_entry->protection = permission & VM_PROT_ALL;
+	user_entry->ref_count = 1;
+
+	user_handle = ipc_kobject_alloc_port((ipc_kobject_t)user_entry, IKOT_NAMED_ENTRY,
+	    IPC_KOBJECT_ALLOC_MAKE_SEND | IPC_KOBJECT_ALLOC_NSREQUEST);
+
+	*object_handle = user_handle;
+	*size = map_size;
+	return KERN_SUCCESS;
 };
 
 kern_return_t mach_memory_entry_access_tracking(ipc_port_t entry_port, int* access_tracking, uint32_t* access_tracking_reads, uint32_t* access_tracking_writes) {
@@ -590,8 +867,127 @@ kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t addr, ma
 	dtape_stub_unsafe();
 };
 
+__attribute__((used)) static const char dtape_named_entry_prot_check_v1[] = "dtape_named_entry_prot_check_v1";
+
 kern_return_t mach_vm_map_external(vm_map_t target_map, mach_vm_offset_t* address, mach_vm_size_t initial_size, mach_vm_offset_t mask, int flags, ipc_port_t port, vm_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance) {
-	dtape_stub_safe();
+	dtape_memory_flags_t memflags = 0;
+	int prot = 0;
+	uintptr_t addr;
+	vm_named_entry_t named_entry = NULL;
+	vm_map_copy_t named_copy = VM_MAP_COPY_NULL;
+	dtape_map_shared_descriptor_t* descriptor = NULL;
+	uint64_t map_offset = offset;
+	uintptr_t hint;
+
+	(void)copy;
+	(void)inheritance;
+
+	if (target_map == VM_MAP_NULL || address == NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	if (cur_protection & VM_PROT_READ) {
+		prot |= PROT_READ;
+	}
+	if (cur_protection & VM_PROT_WRITE) {
+		prot |= PROT_WRITE;
+	}
+	if (cur_protection & VM_PROT_EXECUTE) {
+		prot |= PROT_EXEC;
+	}
+	if (prot == 0) {
+		prot = PROT_READ | PROT_WRITE;
+	}
+
+	if (!(flags & VM_FLAGS_ANYWHERE)) {
+		memflags |= dtape_memory_flag_fixed;
+	}
+	if (flags & VM_FLAGS_OVERWRITE) {
+		memflags |= dtape_memory_flag_overwrite;
+	}
+
+	hint = (uintptr_t)*address;
+
+	if (IP_VALID(port) && ip_kotype(port) == IKOT_NAMED_ENTRY) {
+		named_entry = (vm_named_entry_t) ip_get_kobject(port);
+		if (named_entry) {
+			vm_prot_t entry_prot = named_entry->protection & VM_PROT_ALL;
+			if ((entry_prot & max_protection) != max_protection ||
+			    (entry_prot & cur_protection) != cur_protection) {
+				return KERN_INVALID_RIGHT;
+			}
+		}
+		if (named_entry && named_entry->is_copy) {
+			named_copy = named_entry->backing.copy;
+			if (named_copy) {
+				descriptor = named_copy->dtape_descriptor;
+			}
+			map_offset = named_entry->offset + offset;
+			if (initial_size == 0) {
+				if (map_offset >= named_entry->size) {
+					return KERN_INVALID_ARGUMENT;
+				}
+				initial_size = named_entry->size - map_offset;
+			}
+		}
+	}
+
+	if (descriptor) {
+		kern_return_t kr;
+		dtape_map_shared_entry_t* shared_entry;
+		uint64_t mapped_size;
+		uint64_t page_size = dtape_page_size();
+
+		if ((map_offset & (page_size - 1)) != 0) {
+			return KERN_INVALID_ARGUMENT;
+		}
+
+		if (initial_size == 0) {
+			*address = 0;
+			return KERN_SUCCESS;
+		}
+
+		mapped_size = dtape_round_page(initial_size);
+		kr = dtape_map_memfd_aligned(target_map, descriptor->memfd, mapped_size, prot, hint, map_offset, mask, memflags, &addr);
+		if (kr != KERN_SUCCESS) {
+			return kr;
+		}
+
+		if (target_map != kernel_map) {
+			shared_entry = dtape_map_shared_entry_create(addr, mapped_size, dtape_byte_count_to_page_count_round_down(map_offset), descriptor);
+			if (!shared_entry) {
+				dtape_task_unmap_bytes(target_map, addr, mapped_size);
+				return KERN_RESOURCE_SHORTAGE;
+			}
+			dtape_map_insert_shared_entry(target_map, shared_entry);
+		}
+
+		*address = addr;
+		return KERN_SUCCESS;
+	}
+
+	if (target_map == kernel_map) {
+		void* mapped = mmap((void*)((flags & VM_FLAGS_ANYWHERE) ? 0 : (uintptr_t)*address), (size_t)initial_size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (mapped == MAP_FAILED) {
+			return KERN_RESOURCE_SHORTAGE;
+		}
+		addr = (uintptr_t)mapped;
+	} else {
+		addr = dtape_hooks->task_allocate_pages(target_map->dtape_task->context, dtape_byte_count_to_page_count_round_up(initial_size), prot, (flags & VM_FLAGS_ANYWHERE) ? 0 : *address, memflags);
+		if (addr == 0) {
+			return KERN_RESOURCE_SHORTAGE;
+		}
+	}
+
+	if (named_copy && named_copy->cpy_kdata && named_copy->size > 0) {
+		vm_size_t n = (named_copy->size < initial_size) ? (vm_size_t)named_copy->size : (vm_size_t)initial_size;
+		if (copyoutmap(target_map, named_copy->cpy_kdata, addr, n)) {
+			vm_map_remove(target_map, vm_map_trunc_page(addr, VM_MAP_PAGE_MASK(target_map)), vm_map_round_page(addr + n, VM_MAP_PAGE_MASK(target_map)), 0);
+			return KERN_INVALID_ADDRESS;
+		}
+	}
+
+	*address = addr;
 	return KERN_SUCCESS;
 };
 
@@ -704,10 +1100,13 @@ kern_return_t mach_vm_region(vm_map_t map, mach_vm_offset_t* address, mach_vm_si
 					out->protection |= VM_PROT_READ;
 				if (region_info.protection & dtape_memory_protection_write)
 					out->protection |= VM_PROT_WRITE;
-				// This is a special hack for LLDB. For processes started as suspended, with two RX segments.
-				// However, in order to avoid failures, they are actually mapped as RWX and are to be changed to RX later by dyld.
 				if (region_info.protection & dtape_memory_protection_execute)
-					//out->protection |= VM_PROT_EXECUTE;
+					out->protection |= VM_PROT_EXECUTE | VM_PROT_READ;
+				/* LLDB RX hack: suspended processes map dyld RX segments as RWX.
+				 * Apply only when the Linux mapping is not writable so malloc-zone
+				 * and PartitionAlloc cage pages keep VM_PROT_WRITE. */
+				if ((region_info.protection & dtape_memory_protection_execute) &&
+				    !(region_info.protection & dtape_memory_protection_write))
 					out->protection = VM_PROT_EXECUTE | VM_PROT_READ;
 
 				out->offset = region_info.map_offset;
@@ -732,10 +1131,11 @@ kern_return_t mach_vm_region(vm_map_t map, mach_vm_offset_t* address, mach_vm_si
 					out->protection |= VM_PROT_READ;
 				if (region_info.protection & dtape_memory_protection_write)
 					out->protection |= VM_PROT_WRITE;
-				// This is a special hack for LLDB. For processes started as suspended, with two RX segments.
-				// However, in order to avoid failures, they are actually mapped as RWX and are to be changed to RX later by dyld.
 				if (region_info.protection & dtape_memory_protection_execute)
-					//out->protection |= VM_PROT_EXECUTE;
+					out->protection |= VM_PROT_EXECUTE | VM_PROT_READ;
+				/* LLDB RX hack: skip writable malloc-zone / PA cage pages. */
+				if ((region_info.protection & dtape_memory_protection_execute) &&
+				    !(region_info.protection & dtape_memory_protection_write))
 					out->protection = VM_PROT_EXECUTE | VM_PROT_READ;
 
 				out->offset = region_info.map_offset;

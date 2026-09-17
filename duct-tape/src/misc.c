@@ -8,9 +8,12 @@
 #include <kern/thread_call.h>
 #include <ipc/ipc_object.h>
 #include <ipc/ipc_port.h>
+#include <ipc/ipc_kmsg.h>
+#include <mach/message.h>
 #include <kern/host.h>
 
 #include <sys/types.h>
+#include <stdint.h>
 
 char version[] = "Darling 11.5";
 
@@ -87,10 +90,16 @@ int scnprintf(char* buffer, size_t buffer_size, const char* format, ...) {
 void (ipc_kmsg_trace_send)(ipc_kmsg_t kmsg, mach_msg_option_t option) {
 	pid_t dest_pid = -1;
 	ipc_port_t dest = kmsg->ikm_header->msgh_remote_port;
+	mach_msg_header_t* hdr = kmsg->ikm_header;
 
 	dest_pid = ipc_port_get_receiver_task(dest, NULL);
 
-	dtape_log_debug("sending kmsg %p to pid %d", kmsg, dest_pid);
+	dtape_log_info("sending kmsg %p to pid %d msgh_id=%d msgh_remote_port=%p msgh_local_port=%p option=0x%x receiver_nsid=%d",
+	    kmsg, dest_pid,
+	    hdr ? hdr->msgh_id : 0,
+	    hdr ? (void*)(uintptr_t)hdr->msgh_remote_port : NULL,
+	    hdr ? (void*)(uintptr_t)hdr->msgh_local_port : NULL,
+	    option, dest_pid);
 };
 
 void Assert(const char* file, int line, const char* expression) {

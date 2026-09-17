@@ -25,6 +25,7 @@
 #include <darlingserver/logging.hpp>
 
 #include <fstream>
+#include <sstream>
 #include <regex>
 
 #include <sys/mman.h>
@@ -448,7 +449,7 @@ DarlingServer::Process::MemoryInfo DarlingServer::Process::memoryInfo() const {
 		throw std::system_error(ESRCH, std::generic_category(), "dead process; can't call memoryInfo");
 	}
 
-	MemoryInfo info;
+	MemoryInfo info = {};
 	std::ifstream file("/proc/" + std::to_string(_pid) + "/statm");
 
 	file >> info.virtualSize >> info.residentSize;
@@ -459,8 +460,35 @@ DarlingServer::Process::MemoryInfo DarlingServer::Process::memoryInfo() const {
 	// CHECKME: can different processes have different page sizes on Linux?
 	info.pageSize = sysconf(_SC_PAGESIZE);
 
-	// TODO
-	info.regionCount = 0;
+	std::ifstream mapsFile("/proc/" + std::to_string(_pid) + "/maps");
+	std::string mapsLine;
+	while (std::getline(mapsFile, mapsLine)) {
+		info.regionCount++;
+	}
+
+	std::ifstream statFile("/proc/" + std::to_string(_pid) + "/stat");
+	std::string statLine;
+	if (std::getline(statFile, statLine)) {
+		auto endOfComm = statLine.rfind(')');
+		if (endOfComm != std::string::npos && endOfComm + 1 < statLine.size()) {
+			std::istringstream rest(statLine.substr(endOfComm + 1));
+			char state = 0;
+			unsigned long skip = 0;
+			unsigned long utime = 0;
+			unsigned long stime = 0;
+			rest >> state;
+			for (int i = 0; i < 10; i++) {
+				rest >> skip;
+			}
+			rest >> utime >> stime;
+			long ticks = sysconf(_SC_CLK_TCK);
+			if (ticks <= 0) {
+				ticks = 100;
+			}
+			info.userTimeUsec = (uint64_t)utime * 1000000ULL / (uint64_t)ticks;
+			info.systemTimeUsec = (uint64_t)stime * 1000000ULL / (uint64_t)ticks;
+		}
+	}
 
 	return info;
 };

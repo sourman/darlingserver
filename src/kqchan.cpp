@@ -2,6 +2,7 @@
 #include <darlingserver/server.hpp>
 #include <darlingserver/rpc-supplement.h>
 #include <darlingserver/thread.hpp>
+#include <darlingserver/process.hpp>
 #include <darlingserver/logging.hpp>
 
 #include <sys/socket.h>
@@ -241,6 +242,30 @@ std::shared_ptr<DarlingServer::Kqchan> DarlingServer::Kqchan::MachPort::sharedFr
 	return shared_from_this();
 };
 
+static std::shared_ptr<DarlingServer::Thread> threadOfProcess(std::shared_ptr<DarlingServer::Process> proc, pid_t preferredNstid = 0) {
+	if (!proc) {
+		return nullptr;
+	}
+	if (preferredNstid) {
+		auto maybeThread = DarlingServer::threadRegistry().lookupEntryByNSID(preferredNstid);
+		if (maybeThread) {
+			auto candidate = *maybeThread;
+			if (candidate && candidate->process() && candidate->process()->nsid() == proc->nsid()) {
+				return candidate;
+			}
+		}
+	}
+	auto current = DarlingServer::Thread::currentThread();
+	if (current && current->process() && current->process()->nsid() == proc->nsid()) {
+		return current;
+	}
+	auto threads = proc->threads();
+	if (!threads.empty()) {
+		return threads.front();
+	}
+	return nullptr;
+}
+
 int DarlingServer::Kqchan::MachPort::setup() {
 	auto proc = _process.lock();
 
@@ -250,13 +275,41 @@ int DarlingServer::Kqchan::MachPort::setup() {
 
 	kqchanMachPortLog.debug() << *this << ": Setting up Mach port kqchan" << kqchanMachPortLog.endLog;
 
+	auto opener = threadOfProcess(proc);
+	if (!opener) {
+		throw std::system_error(ESRCH, std::generic_category());
+	}
+
+	kqchanMachPortLog.debug() << *this << ": attaching EVFILT_MACHPORT nsid=" << proc->nsid()
+		<< " port=" << _port << " opener_nstid=" << opener->nsid() << kqchanMachPortLog.endLog;
+
 	// NOTE: the duct-taped kqchan will never notify us after we die
 	//       since we disable notifications upon destruction,
-	//       so using `this` here is safe
-	_dtapeKqchan = dtape_kqchan_mach_port_create(proc->_dtapeTask, _port, _receiveBuffer, _receiveBufferSize, _savedFilterFlags, [](void* context) {
-		auto self = reinterpret_cast<MachPort*>(context);
-		self->_notify();
-	}, this);
+	//       so using `this` here is safe.
+	// Impersonate the opener so filt_machportattach's current_space() is the
+	// opener's ipc space. If we are already on the opener (processCall),
+	// create directly to avoid impersonate/defer deadlock.
+	auto doCreate = [&]() {
+		auto runner = Thread::currentThread();
+		bool impersonated = false;
+		if (runner && runner.get() != opener.get()) {
+			runner->impersonate(opener);
+			impersonated = true;
+		}
+		_dtapeKqchan = dtape_kqchan_mach_port_create(proc->_dtapeTask, _port, _receiveBuffer, _receiveBufferSize, _savedFilterFlags, [](void* context) {
+			auto self = reinterpret_cast<MachPort*>(context);
+			self->_notify();
+		}, this);
+		if (impersonated) {
+			runner->impersonate(nullptr);
+		}
+	};
+
+	if (Thread::currentThread() && Thread::currentThread().get() == opener.get()) {
+		doCreate();
+	} else {
+		Thread::kernelSync(doCreate);
+	}
 	if (!_dtapeKqchan) {
 		kqchanMachPortLog.debug() << *this << ": Failed to create duct-taped Mach port kqchan for port " << _port << kqchanMachPortLog.endLog;
 		throw std::system_error(ESRCH, std::generic_category());
@@ -370,13 +423,11 @@ void DarlingServer::Kqchan::MachPort::_read(uint64_t defaultBuffer, uint64_t def
 		_deferNotification = true;
 	}
 
-	auto maybeThread = threadRegistry().lookupEntryByNSID(nstid);
+	auto thread = threadOfProcess(_process.lock(), nstid);
 
-	if (!maybeThread) {
-		throw std::runtime_error("No thread for Mach port kqchan read?");
+	if (!thread) {
+		throw std::runtime_error("No thread of kqchan process for Mach port kqchan read?");
 	}
-
-	auto thread = *maybeThread;
 
 	auto self = shared_from_this();
 	Thread::kernelAsync([self, thread, defaultBuffer, defaultBufferSize]() {

@@ -28,6 +28,9 @@ uint32_t dtape_mach_reply_port(void);
 uint32_t dtape_thread_get_special_reply_port(void);
 uint32_t dtape_mk_timer_create(void);
 
+int dtape_fileport_makeport(int fd, uint32_t* out_name);
+int dtape_fileport_makefd(uint32_t port_name, int* out_fd);
+
 DSERVER_DTAPE_DECLS;
 
 typedef void (*dtape_kqchan_mach_port_notification_callback_f)(void* context);
@@ -79,6 +82,18 @@ void dtape_thread_release(dtape_thread_t* thread);
 void dtape_thread_sigexc_enter(dtape_thread_t* thread);
 void dtape_thread_sigexc_exit(dtape_thread_t* thread);
 void dtape_thread_sigexc_enter2(dtape_thread_t* thread);
+
+typedef struct dtape_thread_wait_info {
+	bool waiting;
+	bool owns_kmsg;
+	int wait_result;
+	unsigned int receive_state;
+} dtape_thread_wait_info_t;
+
+void dtape_thread_get_wait_info(dtape_thread_t* thread, dtape_thread_wait_info_t* info);
+bool dtape_thread_is_parked_mach_receive(dtape_thread_t* thread);
+bool dtape_thread_sigexc_should_complete_wait(dtape_thread_t* thread);
+bool dtape_thread_sigexc_is_waiting(dtape_thread_t* thread);
 void dtape_thread_dying(dtape_thread_t* thread);
 
 void dtape_task_uidgid(dtape_task_t* task, int new_uid, int new_gid, int* old_uid, int* old_gid);

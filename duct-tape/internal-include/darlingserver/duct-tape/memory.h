@@ -52,6 +52,7 @@ struct vm_map_copy {
 		vm_object_t object;
 		void* kdata;
 	} c_u;
+	dtape_map_shared_descriptor_t* dtape_descriptor;
 	char dtape_copy_data[];
 };
 

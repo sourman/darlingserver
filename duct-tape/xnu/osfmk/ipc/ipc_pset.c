@@ -731,7 +731,12 @@ filt_machportattach(
 {
 	mach_port_name_t name = (mach_port_name_t)kn->kn_id;
 	uint64_t wq_link_id = waitq_link_reserve(NULL);
+#ifdef __DARLING__
+	extern ipc_space_t dtape_kqchan_attach_space(void);
+	ipc_space_t space = dtape_kqchan_attach_space();
+#else
 	ipc_space_t space = current_space();
+#endif
 	ipc_kmsg_t first;
 	struct turnstile *send_turnstile = TURNSTILE_NULL;
 

@@ -38,8 +38,10 @@ struct dtape_thread {
 	bool processing_signal;
 
 	bool waiting_suspended;
+	bool hold_signal_sent;
 	dtape_mutex_t suspension_mutex;
 	dtape_condvar_t suspension_condvar;
+	bool is_kqchan_waitq_waiter;
 
 	//
 	// uthread stuff for psynch
@@ -53,6 +55,14 @@ struct dtape_thread {
 
 	struct thread xnu_thread;
 };
+
+/*
+ * Real kmsg handoff: ith_state == MACH_MSG_SUCCESS && ith_kmsg != IKM_NULL.
+ * IKM_NULL is ((ipc_kmsg_t)0). ith_kmsg shares a union with
+ * ith_ppriority/ith_qos_override; a stale overlay (commonly 0x7f0000000000)
+ * during MACH_RCV_IN_PROGRESS is not a kmsg.
+ */
+bool ipc_thread_owns_kmsg(thread_t thread);
 
 __attribute__((always_inline))
 static dtape_thread_t* dtape_thread_for_xnu_thread(thread_t xnu_thread) {

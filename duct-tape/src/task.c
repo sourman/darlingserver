@@ -20,6 +20,7 @@
 #include <ipc/ipc_hash.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 task_t kernel_task = NULL;
 
@@ -71,6 +72,7 @@ dtape_task_t* dtape_task_create(dtape_task_t* parent_task, uint32_t nsid, void* 
 	task->has_sigexc = false;
 	task->dyld_info_addr = 0;
 	task->dyld_info_length = 0;
+	task->dyld_info_known = false;
 	task->p_ident.eid = dtape_hooks->task_eternal_id(context);
 	dtape_mutex_init(&task->dyld_info_lock);
 	dtape_condvar_init(&task->dyld_info_condvar);
@@ -200,6 +202,7 @@ void dtape_task_set_dyld_info(dtape_task_t* task, uint64_t address, uint64_t len
 	dtape_log_debug("setting dyld info to %llu bytes at %llx", length, address);
 	task->dyld_info_addr = address;
 	task->dyld_info_length = length;
+	task->dyld_info_known = true;
 	dtape_mutex_unlock(&task->dyld_info_lock);
 	dtape_condvar_signal(&task->dyld_info_condvar, SIZE_MAX);
 };
@@ -304,19 +307,18 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 
 	switch (flavor) {
 		case TASK_BASIC_INFO_32:
+		case TASK_BASIC2_INFO_32:
 		case TASK_BASIC_INFO_64:
 		case MACH_TASK_BASIC_INFO: {
-			uint64_t utimeus;
-			uint64_t stimeus;
 			dtape_memory_info_t mem_info;
 
 			dtape_hooks->task_get_memory_info(task->context, &mem_info);
 
-			dtape_log_debug("%s: TODO: fetch utimeus and stimeus somehow", __FUNCTION__);
-			utimeus = 0;
-			stimeus = 0;
+			/* terminated-thread times; live threads are TASK_THREAD_TIMES_INFO */
+			uint64_t utimeus = 0;
+			uint64_t stimeus = 0;
 
-			if (flavor == TASK_BASIC_INFO_32) {
+			if (flavor == TASK_BASIC_INFO_32 || flavor == TASK_BASIC2_INFO_32) {
 				struct task_basic_info_32* info = (void*)task_info_out;
 
 				if (*task_info_count < TASK_BASIC_INFO_32_COUNT) {
@@ -362,6 +364,7 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 				info->suspend_count = task->xnu_task.user_stop_count;
 				info->virtual_size = mem_info.virtual_size;
 				info->resident_size = mem_info.resident_size;
+				info->resident_size_max = mem_info.resident_size;
 				info->user_time.seconds = utimeus / USEC_PER_SEC;
 				info->user_time.microseconds = utimeus % USEC_PER_SEC;
 				info->system_time.seconds = stimeus / USEC_PER_SEC;
@@ -374,15 +377,16 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 
 		case TASK_THREAD_TIMES_INFO: {
 			task_thread_times_info_data_t* info = (task_thread_times_info_data_t*)task_info_out;
+			dtape_memory_info_t mem_info;
 
 			if (*task_info_count < TASK_THREAD_TIMES_INFO_COUNT) {
 				return KERN_INVALID_ARGUMENT;
 			}
 			*task_info_count = TASK_THREAD_TIMES_INFO_COUNT;
 
-			dtape_log_debug("%s: TODO: fetch utimeus and stimeus somehow", __FUNCTION__);
-			uint64_t utimeus = 0;
-			uint64_t stimeus = 0;
+			dtape_hooks->task_get_memory_info(task->context, &mem_info);
+			uint64_t utimeus = mem_info.user_time_usec;
+			uint64_t stimeus = mem_info.system_time_usec;
 
 			info->user_time.seconds = utimeus / USEC_PER_SEC;
 			info->user_time.microseconds = utimeus % USEC_PER_SEC;
@@ -392,8 +396,143 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 			return KERN_SUCCESS;
 		};
 
+		case TASK_ABSOLUTETIME_INFO: {
+			task_absolutetime_info_t info = (task_absolutetime_info_t)task_info_out;
+			dtape_memory_info_t mem_info;
+			uint64_t user_ns;
+			uint64_t system_ns;
+
+			if (*task_info_count < TASK_ABSOLUTETIME_INFO_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			dtape_hooks->task_get_memory_info(task->context, &mem_info);
+			user_ns = mem_info.user_time_usec * 1000ULL;
+			system_ns = mem_info.system_time_usec * 1000ULL;
+
+			info->total_user = user_ns;
+			info->total_system = system_ns;
+			info->threads_user = user_ns;
+			info->threads_system = system_ns;
+			*task_info_count = TASK_ABSOLUTETIME_INFO_COUNT;
+			return KERN_SUCCESS;
+		};
+
+		case TASK_EVENTS_INFO: {
+			task_events_info_t info = (task_events_info_t)task_info_out;
+
+			if (*task_info_count < TASK_EVENTS_INFO_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			memset(info, 0, sizeof(*info));
+			*task_info_count = TASK_EVENTS_INFO_COUNT;
+			return KERN_SUCCESS;
+		};
+
+		case TASK_KERNELMEMORY_INFO: {
+			task_kernelmemory_info_t info = (task_kernelmemory_info_t)task_info_out;
+
+			if (*task_info_count < TASK_KERNELMEMORY_INFO_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			memset(info, 0, sizeof(*info));
+			*task_info_count = TASK_KERNELMEMORY_INFO_COUNT;
+			return KERN_SUCCESS;
+		};
+
+		case TASK_SECURITY_TOKEN: {
+			security_token_t* sec_token_p;
+
+			if (*task_info_count < TASK_SECURITY_TOKEN_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			sec_token_p = (security_token_t*)task_info_out;
+			*sec_token_p = task->xnu_task.sec_token;
+			*task_info_count = TASK_SECURITY_TOKEN_COUNT;
+			return KERN_SUCCESS;
+		};
+
+		case TASK_AFFINITY_TAG_INFO: {
+			task_affinity_tag_info_t info = (task_affinity_tag_info_t)task_info_out;
+
+			if (*task_info_count < TASK_AFFINITY_TAG_INFO_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			memset(info, 0, sizeof(*info));
+			*task_info_count = TASK_AFFINITY_TAG_INFO_COUNT;
+			return KERN_SUCCESS;
+		};
+
+		case TASK_EXTMOD_INFO: {
+			task_extmod_info_t info = (task_extmod_info_t)task_info_out;
+
+			if (*task_info_count < TASK_EXTMOD_INFO_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			memset(info, 0, sizeof(*info));
+			info->extmod_statistics = task->xnu_task.extmod_statistics;
+			*task_info_count = TASK_EXTMOD_INFO_COUNT;
+			return KERN_SUCCESS;
+		};
+
+		case TASK_POWER_INFO: {
+			task_power_info_t info = (task_power_info_t)task_info_out;
+			dtape_memory_info_t mem_info;
+
+			if (*task_info_count < TASK_POWER_INFO_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			dtape_hooks->task_get_memory_info(task->context, &mem_info);
+			memset(info, 0, sizeof(*info));
+			info->total_user = mem_info.user_time_usec * 1000ULL;
+			info->total_system = mem_info.system_time_usec * 1000ULL;
+			*task_info_count = TASK_POWER_INFO_COUNT;
+			return KERN_SUCCESS;
+		};
+
+		case TASK_POWER_INFO_V2: {
+			task_power_info_v2_t info = (task_power_info_v2_t)task_info_out;
+			dtape_memory_info_t mem_info;
+			mach_msg_type_number_t orig_info_count = *task_info_count;
+
+			if (orig_info_count < TASK_POWER_INFO_V2_COUNT_OLD) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			dtape_hooks->task_get_memory_info(task->context, &mem_info);
+			memset(info, 0, orig_info_count * sizeof(natural_t));
+			info->cpu_energy.total_user = mem_info.user_time_usec * 1000ULL;
+			info->cpu_energy.total_system = mem_info.system_time_usec * 1000ULL;
+			if (orig_info_count >= TASK_POWER_INFO_V2_COUNT) {
+				*task_info_count = TASK_POWER_INFO_V2_COUNT;
+			} else {
+				*task_info_count = TASK_POWER_INFO_V2_COUNT_OLD;
+			}
+			return KERN_SUCCESS;
+		};
+
+		case TASK_WAIT_STATE_INFO: {
+			task_wait_state_info_t info = (task_wait_state_info_t)task_info_out;
+
+			if (*task_info_count < TASK_WAIT_STATE_INFO_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			memset(info, 0, sizeof(*info));
+			*task_info_count = TASK_WAIT_STATE_INFO_COUNT;
+			return KERN_SUCCESS;
+		};
+
 		case TASK_DYLD_INFO: {
 			task_dyld_info_t info = (task_dyld_info_t)task_info_out;
+			uint64_t addr;
+			uint64_t length;
 
 			/*
 			* We added the format field to TASK_DYLD_INFO output.  For
@@ -408,26 +547,38 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 				return KERN_INVALID_ARGUMENT;
 			}
 
-			// DARLING:
-			// This call may block, waiting for Darling to provide this information
-			// shortly after startup.
-
-			dtape_log_debug("going to read dyld info for task %p (%d)", task, task->saved_pid);
-
+			/*
+			 * Return the real dyld __all_image_info address from mldr, or
+			 * KERN_INVALID_ARGUMENT if unknown. Never succeed with a
+			 * NULL all_image_info pointer: Chromium/dyld will follow it.
+			 *
+			 * XNU copies task->all_image_info_{addr,size} which may still
+			 * be zero before exec completes. A zero success is worse here
+			 * than refusing the flavor.
+			 */
 			dtape_mutex_lock(&task->dyld_info_lock);
 
-			while (task->dyld_info_addr == 0 && task->dyld_info_length == 0) {
-				dtape_log_debug("going to wait for dyld info for task %p (%d)", task, task->saved_pid);
-				dtape_condvar_wait(&task->dyld_info_condvar, &task->dyld_info_lock);
-				dtape_log_debug("awoken from dyld info wait for task %p (%d)", task, task->saved_pid);
+			if (task->saved_pid != 0) {
+				while (!task->dyld_info_known) {
+					dtape_log_debug("going to wait for dyld info for task %p (%d)", task, task->saved_pid);
+					dtape_condvar_wait(&task->dyld_info_condvar, &task->dyld_info_lock);
+				}
 			}
 
-			info->all_image_info_addr = task->dyld_info_addr;
-			info->all_image_info_size = task->dyld_info_length;
-
+			addr = task->dyld_info_addr;
+			length = task->dyld_info_length;
 			dtape_mutex_unlock(&task->dyld_info_lock);
 
-			dtape_log_debug("got dyld info for task %p (%d): %llu bytes at %llx", task, task->saved_pid, info->all_image_info_addr, info->all_image_info_size);
+			if (addr == 0 || length == 0) {
+				dtape_log_warning("TASK_DYLD_INFO for task %p (%d): unknown all_image_info (addr=%llx size=%llx) -> KERN_INVALID_ARGUMENT",
+					task, task->saved_pid, addr, length);
+				return KERN_INVALID_ARGUMENT;
+			}
+
+			info->all_image_info_addr = addr;
+			info->all_image_info_size = length;
+
+			dtape_log_debug("got dyld info for task %p (%d): %llu bytes at %llx", task, task->saved_pid, addr, length);
 
 			/* only set format on output for those expecting it */
 			if (*task_info_count >= TASK_DYLD_INFO_COUNT) {
@@ -454,7 +605,8 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 			return KERN_SUCCESS;
 		};
 
-		case TASK_VM_INFO: {
+		case TASK_VM_INFO:
+		case TASK_VM_INFO_PURGEABLE: {
 			task_vm_info_t info = (task_vm_info_t)task_info_out;
 			mach_msg_type_number_t orig_info_count = *task_info_count;
 
@@ -471,25 +623,29 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 			info->resident_size = meminfo.resident_size;
 			info->resident_size_peak = meminfo.resident_size;
 			info->virtual_size = meminfo.virtual_size;
-
-			// TODO: fill in other stuff
+			info->region_count = (integer_t)meminfo.region_count;
+			info->internal = meminfo.resident_size;
+			info->internal_peak = meminfo.resident_size;
 
 			*task_info_count = TASK_VM_INFO_REV0_COUNT;
 
 			if (orig_info_count >= TASK_VM_INFO_REV1_COUNT) {
-
+				info->phys_footprint = meminfo.resident_size;
 				*task_info_count = TASK_VM_INFO_REV1_COUNT;
 
 				if (orig_info_count >= TASK_VM_INFO_REV2_COUNT) {
-
+					/*
+					 * Do not invent Darwin MACH_VM_{MIN,MAX}_ADDRESS.
+					 * A plausible min_address (e.g. page_size) is worse
+					 * than leaving these zero: Chromium uses them as a
+					 * mapping range.
+					 */
 					*task_info_count = TASK_VM_INFO_REV2_COUNT;
 
 					if (orig_info_count >= TASK_VM_INFO_REV3_COUNT) {
-
 						*task_info_count = TASK_VM_INFO_REV3_COUNT;
 
 						if (orig_info_count >= TASK_VM_INFO_REV4_COUNT) {
-
 							*task_info_count = TASK_VM_INFO_REV4_COUNT;
 
 							if (orig_info_count >= TASK_VM_INFO_REV5_COUNT) {
@@ -517,11 +673,13 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 				info->flags = TF_LP64 | TF_64B_DATA;
 			}
 
+			*task_info_count = TASK_FLAGS_INFO_COUNT;
 			return KERN_SUCCESS;
 		};
 
 		default:
-			dtape_stub_unsafe("unimplemented flavor");
+			dtape_log_warning("%s: unimplemented flavor %u", __FUNCTION__, (unsigned)flavor);
+			return KERN_INVALID_ARGUMENT;
 	}
 };
 

@@ -7,7 +7,11 @@
 #include <kern/debug.h>
 #include <stdlib.h>
 #include <ipc/ipc_mqueue.h>
+#include <ipc/ipc_port.h>
+#include <ipc/ipc_space.h>
 #include <kern/thread.h>
+#include <darlingserver/duct-tape/task.h>
+#include <kern/locks.h>
 
 extern int filt_machportattach(struct knote *kn, struct kevent_qos_s *kev);
 extern void filt_machportdetach(struct knote *kn);
@@ -15,6 +19,28 @@ extern int filt_machportevent(struct knote *kn, long hint);
 extern int filt_machporttouch(struct knote *kn, struct kevent_qos_s *kev);
 extern int filt_machportprocess(struct knote *kn, struct kevent_qos_s *kev);
 extern int filt_machportpeek(struct knote *kn);
+
+static __thread ipc_space_t dtape_kqchan_forced_space = IS_NULL;
+
+static LIST_HEAD(dtape_kqchan_list, dtape_kqchan_mach_port) dtape_all_kqchans = LIST_HEAD_INITIALIZER(dtape_all_kqchans);
+static lck_mtx_t dtape_kqchan_list_mtx;
+static int dtape_kqchan_list_mtx_ready = 0;
+
+static void dtape_kqchan_list_lock(void) {
+	if (!dtape_kqchan_list_mtx_ready) {
+		lck_mtx_init(&dtape_kqchan_list_mtx, LCK_GRP_NULL, LCK_ATTR_NULL);
+		dtape_kqchan_list_mtx_ready = 1;
+	}
+	lck_mtx_lock(&dtape_kqchan_list_mtx);
+}
+
+static void dtape_kqchan_list_unlock(void) {
+	lck_mtx_unlock(&dtape_kqchan_list_mtx);
+}
+
+ipc_space_t dtape_kqchan_attach_space(void) {
+	return dtape_kqchan_forced_space ? dtape_kqchan_forced_space : current_space();
+}
 
 dtape_kqchan_mach_port_t* dtape_kqchan_mach_port_create(dtape_task_t* owning_task, uint32_t port, uint64_t receive_buffer, uint64_t receive_buffer_size, uint64_t saved_filter_flags, dtape_kqchan_mach_port_notification_callback_f notification_callback, void* context) {
 	dtape_kqchan_mach_port_t* kqchan = malloc(sizeof(dtape_kqchan_mach_port_t));
@@ -39,13 +65,27 @@ dtape_kqchan_mach_port_t* dtape_kqchan_mach_port_create(dtape_task_t* owning_tas
 	kqchan->knote.kn_sfflags = saved_filter_flags;
 	kqchan->knote.kn_filter = EVFILT_MACHPORT;
 
-	// try to attach to the Mach port
+	// Resolve the port in the opener's ipc space, not leftover current_space()
+	// from a kernel runner / previous impersonation.
+	dtape_kqchan_forced_space = owning_task->xnu_task.itk_space;
 	filt_machportattach(&kqchan->knote, NULL);
+	dtape_kqchan_forced_space = IS_NULL;
+
+	dtape_log_debug("kqchan attach nsid=%u port=%u mqueue=%p knote=%p itk_space=%p current_space=%p",
+		owning_task->saved_pid, port, kqchan->knote.kn_mqueue, &kqchan->knote,
+		owning_task->xnu_task.itk_space, current_space());
 
 	if (kqchan->knote.kn_flags & EV_ERROR) {
+		dtape_log_debug("kqchan attach FAILED nsid=%u port=%u err=%lld itk_space=%p current_space=%p",
+			owning_task->saved_pid, port, (long long)kqchan->knote.kn_sdata,
+			owning_task->xnu_task.itk_space, current_space());
 		free(kqchan);
 		return NULL;
 	}
+
+	dtape_kqchan_list_lock();
+	LIST_INSERT_HEAD(&dtape_all_kqchans, kqchan, all_kqchans);
+	dtape_kqchan_list_unlock();
 
 	return kqchan;
 };
@@ -56,6 +96,10 @@ void dtape_kqchan_mach_port_destroy(dtape_kqchan_mach_port_t* kqchan) {
 	}
 
 	filt_machportdetach(&kqchan->knote);
+
+	dtape_kqchan_list_lock();
+	LIST_REMOVE(kqchan, all_kqchans);
+	dtape_kqchan_list_unlock();
 
 	task_deallocate(&kqchan->task->xnu_task);
 
@@ -133,31 +177,64 @@ kevent_ctx_t kevent_get_context(thread_t xthread) {
 	return &thread->kevent_ctx;
 };
 
-static void knote_post(struct knote* kn, long hint) {
+static void knote_post(struct knote* kn, long hint, ipc_mqueue_t posted) {
 	dtape_kqchan_mach_port_t* kqchan = __container_of(kn, dtape_kqchan_mach_port_t, knote);
 
-	dtape_log_debug("%s: kn=%p, kqchan=%p, kqchan->callback=%p", __FUNCTION__, kn, kqchan, kqchan->callback);
+	dtape_log_debug("%s: kn=%p, kqchan=%p, kqchan->callback=%p nsid=%u", __FUNCTION__, kn, kqchan, kqchan->callback, kqchan->task ? kqchan->task->saved_pid : 0);
 
 	if (!kqchan->callback) {
 		return;
 	}
 
-#if 0
-	if (!dtape_kqchan_mach_port_has_events(kqchan)) {
+	/* Skip knotes attached to a different mqueue. Do not also require
+	 * ip_receiver == kqchan task space: after bootstrap_check_in
+	 * MOVE_RECEIVE, ip_receiver can still name launchd while the
+	 * checking-in task holds the receive right and the knote. That
+	 * skip left Chromium MachPortRendezvous live-but-unserved. */
+	if (posted && kn->kn_mqueue && kn->kn_mqueue != posted) {
+		dtape_log_debug("%s: skip kn=%p kn_mqueue=%p posted=%p (foreign mqueue)", __FUNCTION__, kn, kn->kn_mqueue, posted);
 		return;
 	}
-#endif
 
-	dtape_log_debug("%s: kn=%p, kqchan=%p; invoking callback...", __FUNCTION__, kn, kqchan);
+	dtape_log_debug("%s: wake kn=%p kqchan=%p nsid=%u port=%u mqueue=%p",
+		__FUNCTION__, kn, kqchan, kqchan->task ? kqchan->task->saved_pid : 0,
+		(unsigned)kn->kn_id, kn->kn_mqueue);
 
 	kqchan->callback(kqchan->context);
 };
 
+void dtape_kqchan_notify_mqueue(ipc_mqueue_t mqueue) {
+	dtape_kqchan_mach_port_t* kqchan;
+
+	if (!mqueue) {
+		return;
+	}
+
+	dtape_kqchan_list_lock();
+	LIST_FOREACH(kqchan, &dtape_all_kqchans, all_kqchans) {
+		if (kqchan->knote.kn_mqueue == mqueue) {
+			knote_post(&kqchan->knote, 0, mqueue);
+		}
+	}
+	dtape_kqchan_list_unlock();
+};
+
+bool dtape_thread_is_kqchan_waitq_waiter(thread_t thread) {
+	dtape_thread_t* dth;
+
+	if (!thread) {
+		return false;
+	}
+	dth = dtape_thread_for_xnu_thread(thread);
+	return dth && dth->is_kqchan_waitq_waiter;
+};
+
 void knote(struct klist* list, long hint) {
 	struct knote *kn;
+	ipc_mqueue_t posted = __container_of(list, struct ipc_mqueue, imq_klist);
 
 	SLIST_FOREACH(kn, list, kn_selnext) {
-		knote_post(kn, hint);
+		knote_post(kn, hint, posted);
 	}
 };
 
@@ -171,17 +248,25 @@ void knote_vanish(struct klist* list, bool make_active) {
 		dtape_log_debug("knote %p is vanishing", kn);
 		// TODO: handle the old style of vanishing (i.e. `EV_EOF | EV_ONESHOT`)
 		kn->kn_status |= KN_VANISHED;
-		knote_post(kn, 0);
+		knote_post(kn, 0, kn->kn_mqueue);
 	}
 };
 
 static void kqchan_waitq_waiter_entry(void* context, wait_result_t wait_result) {
 	dtape_kqchan_mach_port_t* kqchan = context;
 	struct waitq* wq = NULL;
+	dtape_thread_t* self = dtape_thread_for_xnu_thread(current_thread());
 
 	dtape_log_debug("kqchan waitq waiter thread entering");
 
+	if (self) {
+		self->is_kqchan_waitq_waiter = true;
+	}
+	/* Never appear as a mach_msg receiver to ipc_mqueue_post. */
+	current_thread()->ith_state = 0;
+
 	while ((wq = kqchan->waitq) != NULL) {
+		current_thread()->ith_state = 0;
 		if ((wait_result = waitq_assert_wait64(wq, IPC_MQUEUE_RECEIVE, THREAD_INTERRUPTIBLE, 0)) == THREAD_WAITING) {
 			wait_result = thread_block(NULL);
 		}

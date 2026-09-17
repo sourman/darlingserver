@@ -34,6 +34,8 @@ typedef struct dtape_memory_info {
 	uint64_t resident_size;
 	uint64_t page_size;
 	uint64_t region_count;
+	uint64_t user_time_usec;
+	uint64_t system_time_usec;
 } dtape_memory_info_t;
 
 typedef enum dtape_memory_protection {

@@ -3826,13 +3826,14 @@ ipc_kmsg_copyin_body(
 				 * Out-of-line memory descriptor, accumulate kernel
 				 * memory requirements
 				 */
-				if (space_needed + round_page(size) <= space_needed) {
+				vm_size_t this_needed = round_page(size);
+				if (this_needed != 0 && space_needed + this_needed <= space_needed) {
 					/* Overflow dectected */
 					mr = MACH_MSG_VM_KERNEL;
 					goto clean_message;
 				}
 
-				space_needed += round_page(size);
+				space_needed += this_needed;
 				if (space_needed > ipc_kmsg_max_vm_space) {
 					/* Per message kernel memory limit exceeded */
 					mr = MACH_MSG_VM_KERNEL;

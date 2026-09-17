@@ -23,6 +23,7 @@
 #include <string>
 #include <sys/epoll.h>
 #include <thread>
+#include <atomic>
 
 #include <darlingserver/message.hpp>
 #include <darlingserver/workers.hpp>
@@ -46,6 +47,7 @@ namespace DarlingServer {
 		WorkQueue<std::shared_ptr<Thread>> _workQueue;
 		bool _canRead = false;
 		bool _canWrite = true;
+		std::atomic<bool> _forceRead{false};
 		int _wakeupFD;
 		int _timerFD;
 		uint64_t _currentTimerDeadline = 0;
@@ -81,6 +83,12 @@ namespace DarlingServer {
 		void removeMonitor(std::shared_ptr<Monitor> monitor);
 
 		void sendMessage(Message&& message);
+
+		/**
+		 * After interrupt_exit, force another inbox drain so a following
+		 * client sendmsg cannot sit unread on the EPOLLET listener.
+		 */
+		void rearmInbox();
 	};
 };
 

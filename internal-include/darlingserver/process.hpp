@@ -73,6 +73,8 @@ namespace DarlingServer {
 			uint64_t residentSize;
 			uint64_t pageSize;
 			uint64_t regionCount;
+			uint64_t userTimeUsec;
+			uint64_t systemTimeUsec;
 		};
 
 		struct MemoryRegionInfo {

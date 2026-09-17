@@ -276,6 +276,8 @@ struct DTapeHooks {
 		memory_info->resident_size = info.residentSize;
 		memory_info->page_size = info.pageSize;
 		memory_info->region_count = info.regionCount;
+		memory_info->user_time_usec = info.userTimeUsec;
+		memory_info->system_time_usec = info.systemTimeUsec;
 	};
 
 	static bool dtape_hook_task_get_memory_region_info(void* task_context, uintptr_t address, dtape_memory_region_info_t* memory_region_info) {
@@ -533,14 +535,19 @@ void DarlingServer::Server::start() {
 	Thread::kernelSync(dtape_init_in_thread);
 
 	while (true) {
-		if (_canRead) {
+		if (_canRead || _forceRead.exchange(false, std::memory_order_acq_rel)) {
 			_canRead = _inbox.receiveMany(_listenerSocket);
 
 			while (auto msg = _inbox.pop()) {
 				// TODO: this could be done concurrently
-				auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
-				if (call) {
-					_workQueue.push(call->thread());
+				try {
+					auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
+					if (call) {
+						_workQueue.push(call->thread());
+					}
+				} catch (const std::exception& e) {
+					static const auto rpcLog = DarlingServer::Log("rpc");
+					rpcLog.error() << "dropped RPC: " << e.what() << rpcLog.endLog;
 				}
 			}
 		}
@@ -816,4 +823,19 @@ std::shared_ptr<DarlingServer::FD> DarlingServer::Monitor::fd() const {
 
 void DarlingServer::Server::sendMessage(Message&& message) {
 	_outbox.push(std::move(message));
+};
+
+void DarlingServer::Server::rearmInbox() {
+	_forceRead.store(true, std::memory_order_release);
+
+	struct epoll_event settings;
+	settings.data.ptr = this;
+	settings.events = EPOLLIN | EPOLLOUT | EPOLLET;
+	epoll_ctl(_epollFD, EPOLL_CTL_MOD, _listenerSocket, &settings);
+
+	settings.data.ptr = &_wakeupFD;
+	settings.events = EPOLLIN | EPOLLONESHOT;
+	epoll_ctl(_epollFD, EPOLL_CTL_MOD, _wakeupFD, &settings);
+
+	eventfd_write(_wakeupFD, 1);
 };

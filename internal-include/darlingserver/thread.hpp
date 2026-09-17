@@ -87,6 +87,13 @@ namespace DarlingServer {
 		bool _running = false;
 		bool _terminating = false;
 		std::shared_ptr<Call> _activeCall = nullptr;
+		/*
+		 * InterruptEnter/Exit briefly become _activeCall so their _sendReply
+		 * can deactivate themselves. The parked wait (typically mach_msg)
+		 * must survive that swap; otherwise InterruptExit empty-pops and the
+		 * client SA_RESTARTs recvmsg with no one left to reply.
+		 */
+		std::shared_ptr<Call> _parkedWaitCall = nullptr;
 		std::shared_ptr<Thread> _impersonating = nullptr;
 		bool _processingSignal = false;
 		bool _pendingCallOverride = false;
@@ -98,6 +105,7 @@ namespace DarlingServer {
 		uint32_t _bsdReturnValue = 0;
 		bool _interruptedForSignal = false;
 		std::function<void()> _interruptedContinuation = nullptr;
+		bool _rescheduleWhenDone = false;
 		ucontext_t _syscallReturnHereDuringInterrupt;
 		bool _didSyscallReturnDuringInterrupt = false;
 		bool _handlingInterruptedCall = false;
@@ -142,6 +150,7 @@ namespace DarlingServer {
 		void _scheduleRelease();
 
 		static void _handleInterruptEnterForCurrentThread();
+		static void _reparkMachWaitAfterInterruptEnter();
 
 		static StackPool stackPool;
 

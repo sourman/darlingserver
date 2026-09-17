@@ -10,6 +10,8 @@
 #include <kern/ipc_tt.h>
 #include <kern/policy_internal.h>
 #include <mach/thread_act.h>
+#include <mach/message.h>
+#include <ipc/ipc_kmsg.h>
 #include <sys/systm.h>
 #include <sys/ux_exception.h>
 
@@ -53,6 +55,8 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	thread->processing_signal = false;
 	thread->name = NULL;
 	thread->waiting_suspended = false;
+	thread->hold_signal_sent = false;
+	thread->is_kqchan_waitq_waiter = false;
 	LIST_INIT(&thread->user_states);
 	dtape_mutex_init(&thread->suspension_mutex);
 	dtape_condvar_init(&thread->suspension_condvar);
@@ -162,10 +166,20 @@ void dtape_thread_destroy(dtape_thread_t* thread) {
 };
 
 void dtape_thread_entering(dtape_thread_t* thread) {
-	// if the thread is entering, it cannot be waiting
-	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
+	/*
+	 * XNU keeps TH_WAIT until thread_go. InterruptEnter still runs
+	 * dtape_thread_entering; clearing TH_WAIT here would drop a parked
+	 * mach_msg waiter from waitq_wakeup64_identify / clear_wait.
+	 * Kernel thread startup and sigexc park are not Mach receives.
+	 */
+	bool parked_receive = (thread->xnu_thread.wait_result == THREAD_WAITING) &&
+	    (thread->xnu_thread.ith_state == MACH_RCV_IN_PROGRESS ||
+	     thread->xnu_thread.ith_state == MACH_RCV_IN_PROGRESS_TIMED);
+	if (!parked_receive) {
+		thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
+		thread->xnu_thread.block_hint = kThreadWaitNone;
+	}
 	thread->xnu_thread.state |= TH_RUN;
-	thread->xnu_thread.block_hint = kThreadWaitNone;
 };
 
 void dtape_thread_exiting(dtape_thread_t* thread) {
@@ -429,11 +443,78 @@ void dtape_thread_release(dtape_thread_t* thread) {
 	thread_deallocate(&thread->xnu_thread);
 };
 
-void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
+bool ipc_thread_owns_kmsg(thread_t thread) {
+	return thread->ith_state == MACH_MSG_SUCCESS && thread->ith_kmsg != IKM_NULL;
+}
+
+void dtape_thread_get_wait_info(dtape_thread_t* thread, dtape_thread_wait_info_t* info) {
+	if (!info) {
+		return;
+	}
+
 	thread_lock(&thread->xnu_thread);
-	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
-	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
-	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
+	info->waiting = (thread->xnu_thread.state & TH_WAIT) != 0;
+	info->owns_kmsg = ipc_thread_owns_kmsg(&thread->xnu_thread);
+	info->wait_result = thread->xnu_thread.wait_result;
+	info->receive_state = thread->xnu_thread.ith_state;
+	thread_unlock(&thread->xnu_thread);
+};
+
+bool dtape_thread_is_parked_mach_receive(dtape_thread_t* thread) {
+	dtape_thread_wait_info_t info;
+	dtape_thread_get_wait_info(thread, &info);
+	return info.wait_result == THREAD_WAITING && !info.owns_kmsg &&
+	    (info.receive_state == MACH_RCV_IN_PROGRESS ||
+	     info.receive_state == MACH_RCV_IN_PROGRESS_TIMED);
+};
+
+bool dtape_thread_sigexc_should_complete_wait(dtape_thread_t* thread) {
+	dtape_thread_wait_info_t info;
+	dtape_thread_get_wait_info(thread, &info);
+	/*
+	 * A handed-off kmsg is a completed receive even if wait_result is
+	 * still THREAD_WAITING (thread_go races the ith_kmsg store).
+	 * Otherwise THREAD_WAITING means the Mach wait is still parked.
+	 */
+	if (info.owns_kmsg) {
+		return true;
+	}
+	if (info.wait_result == THREAD_WAITING) {
+		return false;
+	}
+	if (info.wait_result == THREAD_AWAKENED ||
+	    info.wait_result == THREAD_TIMED_OUT ||
+	    info.wait_result == THREAD_RESTART) {
+		return true;
+	}
+	return false;
+};
+
+bool dtape_thread_sigexc_is_waiting(dtape_thread_t* thread) {
+	dtape_thread_wait_info_t info;
+	dtape_thread_get_wait_info(thread, &info);
+	return info.wait_result == THREAD_WAITING && !info.owns_kmsg;
+};
+
+void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
+	/*
+	 * XNU: thread_suspend → thread_hold only sets AST_BLOCK. A thread
+	 * blocked in mach_msg_receive stays blocked and is held on return to
+	 * user. MACH_RCV_INTERRUPTED comes only from thread_abort*.
+	 * clear_wait on a thread that is no longer TH_WAIT is a no-op and
+	 * never overwrites wait_result; a handed-off ith_kmsg is always
+	 * returned.
+	 *
+	 * thread_hold now skips LINUX_SIGRTMIN for parked/kmsg-owned threads.
+	 * If a signal still arrives, do not convert it into a Mach receive abort.
+	 */
+	thread_lock(&thread->xnu_thread);
+	dtape_log_debug("sigexc: enter nstid=%llu state=0x%x wait_result=%d ith_state=0x%x ith_kmsg=%p (not aborting Mach wait)",
+	    (unsigned long long)thread->xnu_thread.thread_id,
+	    thread->xnu_thread.state,
+	    thread->xnu_thread.wait_result,
+	    thread->xnu_thread.ith_state,
+	    thread->xnu_thread.ith_kmsg);
 	thread_unlock(&thread->xnu_thread);
 };
 
@@ -505,6 +586,10 @@ static void thread_continuation_callback(void* context) {
 	thread->xnu_thread.parameter = NULL;
 
 	wait_result = thread->xnu_thread.wait_result;
+	if (wait_result == THREAD_WAITING && ipc_thread_owns_kmsg(&thread->xnu_thread)) {
+		wait_result = THREAD_AWAKENED;
+		thread->xnu_thread.wait_result = THREAD_AWAKENED;
+	}
 	thread_unlock(&thread->xnu_thread);
 
 	continuation(parameter, wait_result);
@@ -863,7 +948,16 @@ thread_get_state_internal(
 {
 	dtape_thread_t* dthread = dtape_thread_for_xnu_thread(thread);
 	dtape_task_t* dtask = dtape_task_for_thread(dthread);
+	/*
+	 * Without a fresh SIGRTMIN snapshot (parked Mach wait / kmsg-owned
+	 * hold), serve the last captured user_states head. default_state is
+	 * always on that list at create. Do not invent a kmsg or
+	 * MACH_RCV_INTERRUPTED.
+	 */
 	dtape_thread_user_state_t* user_state = LIST_FIRST(&dthread->user_states);
+	if (!user_state) {
+		user_state = &dthread->default_state;
+	}
 
 	// to_user is used to indicate whether to perform any necessary conversions from kernel to user thread state representations
 	// it currently only does something on ARM64 when the authenticated pointers (`ptrauth_calls`) feature is enabled,
@@ -1350,32 +1444,152 @@ static wait_result_t thread_handoff_internal(thread_t thread, thread_continue_t 
 	return thread_block_parameter(continuation, parameter);
 };
 
+static bool dtape_thread_hold_is_user_running(dtape_thread_t* thread) {
+	dtape_thread_wait_info_t info;
+	dtape_thread_state_t linux_state;
+
+	dtape_thread_get_wait_info(thread, &info);
+	/*
+	 * User-running: not a parked Mach wait (THREAD_WAITING && !owns_kmsg)
+	 * and not a kmsg handoff. TH_WAIT / Linux sleep is already off-CPU;
+	 * XNU would only set AST_BLOCK.
+	 */
+	if (info.wait_result == THREAD_WAITING || info.owns_kmsg || info.waiting) {
+		return false;
+	}
+
+	linux_state = dtape_hooks->thread_get_state(thread->context);
+	if (linux_state == dtape_thread_state_interruptible ||
+	    linux_state == dtape_thread_state_uninterruptible ||
+	    linux_state == dtape_thread_state_stopped ||
+	    linux_state == dtape_thread_state_dead) {
+		return false;
+	}
+	return true;
+}
+
+static bool dtape_thread_is_off_cpu(dtape_thread_t* thread) {
+	dtape_thread_wait_info_t info;
+	dtape_thread_state_t linux_state;
+
+	if ((thread->xnu_thread.state & TH_WAIT) != 0) {
+		return true;
+	}
+
+	dtape_thread_get_wait_info(thread, &info);
+	if (info.waiting || info.wait_result == THREAD_WAITING || info.owns_kmsg) {
+		return true;
+	}
+
+	linux_state = dtape_hooks->thread_get_state(thread->context);
+	return linux_state == dtape_thread_state_interruptible ||
+	    linux_state == dtape_thread_state_uninterruptible ||
+	    linux_state == dtape_thread_state_stopped ||
+	    linux_state == dtape_thread_state_dead;
+}
+
 void thread_hold(thread_t xthread) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	dtape_log_debug("sigexc: thread_hold(%p)\n", xthread);
-	// CHECKME: the LKM was always sending the signal whenever thread_hold got called;
-	//          we mimic XNU here instead. check whether this actually works as expected.
+	/*
+	 * XNU thread_hold only sets AST_BLOCK. Send LINUX_SIGRTMIN only when
+	 * the target is user-running so thread_get_state can capture registers.
+	 * Waiting / kmsg-owned threads stay in their kernel wait; do not
+	 * clear_wait or abort a Mach receive.
+	 */
 	if (xthread->suspend_count++ == 0) {
-		// This signal leads to sigexc.c which will end up calling darlingserver;
-		// darlingserver will hold the caller so long as the suspend_count > 0.
+		if (!dtape_thread_hold_is_user_running(thread)) {
+			dtape_thread_wait_info_t info;
+			dtape_thread_get_wait_info(thread, &info);
+			thread->hold_signal_sent = false;
+			dtape_log_info("sigexc: thread_hold nstid=%llu AST-only wait_result=%d owns_kmsg=%d waiting=%d (no SIGRTMIN)",
+			    (unsigned long long)xthread->thread_id,
+			    info.wait_result, (int)info.owns_kmsg, (int)info.waiting);
+			return;
+		}
+		thread->hold_signal_sent = true;
 		dtape_hooks->thread_send_signal(thread->context, LINUX_SIGRTMIN);
 	}
 };
 
 void thread_release(thread_t xthread) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+	dtape_thread_wait_info_t info;
+	bool suspend_parked;
+
 	dtape_log_debug("sigexc: thread_release(%p)\n", xthread);
-	xthread->suspend_count--;
+
+	if (xthread->suspend_count == 0) {
+		return;
+	}
+
+	if (--xthread->suspend_count != 0) {
+		return;
+	}
+
+	/*
+	 * XNU thread_release only wakes suspend_parked (AST hold park).
+	 * Darling analog: SIGRTMIN hold of a user-running thread sitting in
+	 * dtape_thread_wait_while_user_suspended (hold_signal_sent &&
+	 * waiting_suspended). A parked mach_msg receive stays blocked until
+	 * ipc_mqueue_post → waitq_wakeup → thread_go (THREAD_AWAKENED).
+	 *
+	 * Do not take XNU's !started/thread_start branch: Darling user threads
+	 * never set started, and kernel threads are started via thread_setup.
+	 */
+	dtape_thread_get_wait_info(thread, &info);
+	suspend_parked = thread->hold_signal_sent && thread->waiting_suspended;
+	if (info.wait_result == THREAD_WAITING || info.owns_kmsg) {
+		if (!suspend_parked) {
+			dtape_log_info("sigexc: thread_release nstid=%llu skip resume wait_result=%d owns_kmsg=%d (not suspend_parked)",
+			    (unsigned long long)xthread->thread_id,
+			    info.wait_result, (int)info.owns_kmsg);
+			return;
+		}
+	}
+	if (!suspend_parked) {
+		return;
+	}
+
 	dtape_hooks->thread_resume(thread->context);
 };
 
 void thread_wait(thread_t xthread, boolean_t until_not_runnable) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
-	dtape_mutex_lock(&thread->suspension_mutex);
-	while (!thread->waiting_suspended) {
+
+	(void)until_not_runnable;
+
+	/*
+	 * XNU waits until the thread is off-CPU (and optionally not runnable).
+	 * waiting_suspended is set only after SIGRTMIN → thread_suspended.
+	 * If thread_hold skipped the signal, the target is already off-CPU;
+	 * do not wait for waiting_suspended or the sampler deadlocks.
+	 */
+	for (;;) {
+		dtape_mutex_lock(&thread->suspension_mutex);
+		if (thread->waiting_suspended) {
+			dtape_mutex_unlock(&thread->suspension_mutex);
+			return;
+		}
+		dtape_mutex_unlock(&thread->suspension_mutex);
+
+		if (dtape_thread_is_off_cpu(thread)) {
+			return;
+		}
+
+		if (!thread->hold_signal_sent) {
+			/* AST-only hold: SIGRTMIN was not sent; do not wait for thread_suspended. */
+			return;
+		}
+
+		dtape_mutex_lock(&thread->suspension_mutex);
+		if (thread->waiting_suspended) {
+			dtape_mutex_unlock(&thread->suspension_mutex);
+			return;
+		}
 		dtape_condvar_wait(&thread->suspension_condvar, &thread->suspension_mutex);
+		dtape_mutex_unlock(&thread->suspension_mutex);
 	}
-	dtape_mutex_unlock(&thread->suspension_mutex);
 };
 
 // ignore the lock timeout

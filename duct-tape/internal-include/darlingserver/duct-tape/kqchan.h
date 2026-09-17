@@ -23,6 +23,7 @@ struct dtape_kqchan_mach_port {
 	struct waitq* waitq;
 	dtape_semaphore_t* waiter_death_semaphore;
 	dtape_semaphore_t* waiter_read_semaphore;
+	LIST_ENTRY(dtape_kqchan_mach_port) all_kqchans;
 };
 
 #endif // _DARLINGSERVER_DUCT_TAPE_KQCHAN_H_

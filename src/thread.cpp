@@ -287,6 +287,14 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Thread::activeCall() const {
 
 void DarlingServer::Thread::makePendingCallActive() {
 	std::unique_lock lock(_rwlock);
+	if (_pendingCall &&
+	    (_pendingCall->number() == Call::Number::InterruptEnter ||
+	     _pendingCall->number() == Call::Number::InterruptExit) &&
+	    _activeCall &&
+	    _activeCall->number() != Call::Number::InterruptEnter &&
+	    _activeCall->number() != Call::Number::InterruptExit) {
+		_parkedWaitCall = _activeCall;
+	}
 	_activeCall = _pendingCall;
 	_pendingCall = nullptr;
 };
@@ -296,6 +304,9 @@ void DarlingServer::Thread::_deactivateCallLocked(std::shared_ptr<Call> expected
 		throw std::runtime_error("Upon deactivating the active call found active/interrupted call != expected call");
 	}
 	(_interruptedForSignal ? _interrupts.top().interruptedCall : _activeCall) = nullptr;
+	if (_parkedWaitCall && _parkedWaitCall.get() == expectedCall.get()) {
+		_parkedWaitCall = nullptr;
+	}
 };
 
 void DarlingServer::Thread::deactivateCall(std::shared_ptr<Call> expectedCall) {
@@ -409,6 +420,7 @@ void DarlingServer::Thread::doWork() {
 	if (_running) {
 		// this is probably an error
 		microthreadLog.warning() << _tid << "(" << _nstid << "): attempt to re-run already running microthread on another thread" << microthreadLog.endLog;
+		_rescheduleWhenDone = true;
 		_rwlock.unlock();
 		return;
 	}
@@ -466,17 +478,59 @@ void DarlingServer::Thread::doWork() {
 			_interruptedContinuation = _continuationCallback;
 			_continuationCallback = nullptr;
 			_interrupts.top().interruptedCall = _activeCall;
+			if (_activeCall &&
+			    _activeCall->number() != Call::Number::InterruptEnter &&
+			    _activeCall->number() != Call::Number::InterruptExit) {
+				_parkedWaitCall = _activeCall;
+			}
 			_activeCall = nullptr;
 		}
 
+		if (!_pendingCallOverride && _pendingCall && _pendingCall->number() == Call::Number::InterruptExit) {
+			/*
+			 * A parked mach_msg wait keeps _continuationCallback set.
+			 * InterruptExit must run without dropping that wait.
+			 */
+			if (_continuationCallback) {
+				_interruptedContinuation = _continuationCallback;
+				_continuationCallback = nullptr;
+			}
+		}
+
 		if (_continuationCallback && _pendingCall) {
-			// we can only have one of the two
-			throw std::runtime_error("Thread has both a pending call and a pending continuation");
+			/*
+			 * Same leftover-continuation case as InterruptExit, but for a
+			 * normal RPC (Chrome continues after dock.mm / AMFI). Throwing
+			 * here abort()s darlingserver and every guest on the prefix.
+			 */
+			microthreadLog.warning() << _tid << "(" << _nstid
+				<< "): pending call "
+				<< Call::callNumberToString(_pendingCall->number())
+				<< " with continuation set; stashing continuation"
+				<< microthreadLog.endLog;
+			if (!_interruptedContinuation) {
+				_interruptedContinuation = _continuationCallback;
+			}
+			_continuationCallback = nullptr;
 		}
 
 		if (_suspended && (_pendingCallOverride || !_pendingCall)) {
 			if (_pendingCallOverride) {
 				microthreadLog.info() << _tid << "(" << _nstid << "): thread was suspended with a pending call override and is now resuming with a pending call" << microthreadLog.endLog;
+			}
+			if (_continuationCallback) {
+				/*
+				 * get_wait_info → thread_lock → current_thread →
+				 * impersonatingThread() takes a shared _rwlock. We already
+				 * hold it uniquely; drop it first or lock_shared throws EDEADLK.
+				 */
+				_rwlock.unlock();
+				const bool parkedReceive = dtape_thread_is_parked_mach_receive(_dtapeThread);
+				_rwlock.lock();
+				if (_continuationCallback && parkedReceive) {
+					microthreadLog.debug() << _tid << "(" << _nstid << "): stay parked; continuation wait_result=THREAD_WAITING without kmsg" << microthreadLog.endLog;
+					goto doneWorking;
+				}
 			}
 			// we were in the middle of processing a call and we need to resume now
 			_suspended = false;
@@ -570,7 +624,11 @@ doneWorking:
 
 			_pendingCall = _pendingInterrupts.front();
 			_pendingInterrupts.pop();
+			_rescheduleWhenDone = false;
 
+			Server::sharedInstance().scheduleThread(shared_from_this());
+		} else if (_rescheduleWhenDone && !_terminating && !_dead) {
+			_rescheduleWhenDone = false;
 			Server::sharedInstance().scheduleThread(shared_from_this());
 		}
 
@@ -1521,17 +1579,17 @@ static thread_local std::function<void()> interruptedContinuation = nullptr;
 
 void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 	// FIXME: this currently does not work properly if the thread was suspended waiting for a lock
+	bool shouldComplete = false;
+	bool stillWaiting = false;
 
 	{
 		std::unique_lock lock(currentThreadVar->_rwlock);
 
 		if (currentThreadVar->_pendingSavedReply) {
-			if (currentThreadVar->_interrupts.top().savedReply) {
-				throw std::runtime_error("Pending saved reply would overwrite saved reply");
+			if (!currentThreadVar->_interrupts.empty()) {
+				currentThreadVar->_interrupts.top().savedReply = std::move(*currentThreadVar->_pendingSavedReply);
+				currentThreadVar->_pendingSavedReply = std::nullopt;
 			}
-
-			currentThreadVar->_interrupts.top().savedReply = std::move(*currentThreadVar->_pendingSavedReply);
-			currentThreadVar->_pendingSavedReply = std::nullopt;
 		}
 
 		currentThreadVar->_interruptedForSignal = true;
@@ -1541,17 +1599,27 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 	}
 
 	dtape_thread_sigexc_enter(currentThreadVar->_dtapeThread);
+	shouldComplete = dtape_thread_sigexc_should_complete_wait(currentThreadVar->_dtapeThread);
+	stillWaiting = dtape_thread_sigexc_is_waiting(currentThreadVar->_dtapeThread);
 
 	currentThreadVar->_didSyscallReturnDuringInterrupt = false;
 	getcontext(&currentThreadVar->_syscallReturnHereDuringInterrupt);
 
 	if (!currentThreadVar->_didSyscallReturnDuringInterrupt) {
-		if (interruptedContinuation) {
-			interruptedContinuation();
-		} else if (currentThreadVar->_interrupts.top().interruptedCall) {
-			currentThreadVar->_handlingInterruptedCall = true;
-			currentThreadVar->_pendingCallOverride = true;
-			currentThreadVar->jumpToResume(currentThreadVar->_interrupts.top().savedStack.base, currentThreadVar->_interrupts.top().savedStack.size);
+		if (shouldComplete) {
+			if (interruptedContinuation) {
+				interruptedContinuation();
+			} else if (currentThreadVar->_interrupts.top().interruptedCall) {
+				currentThreadVar->_handlingInterruptedCall = true;
+				currentThreadVar->_pendingCallOverride = true;
+				currentThreadVar->jumpToResume(currentThreadVar->_interrupts.top().savedStack.base, currentThreadVar->_interrupts.top().savedStack.size);
+			}
+		} else if (stillWaiting) {
+			/*
+			 * XNU thread_hold: a thread blocked in mach_msg_receive stays
+			 * blocked. Keep the wait parked; deliver after interrupt_exit
+			 * when the kmsg is posted (or complete below if it races in).
+			 */
 		}
 	} else if (currentThreadVar->_handlingInterruptedCall) {
 #if DSERVER_ASAN
@@ -1564,6 +1632,18 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 		currentThreadVar->_pendingCallOverride = false;
 	}
 
+	if (!currentThreadVar->_didSyscallReturnDuringInterrupt) {
+		shouldComplete = dtape_thread_sigexc_should_complete_wait(currentThreadVar->_dtapeThread);
+		stillWaiting = dtape_thread_sigexc_is_waiting(currentThreadVar->_dtapeThread);
+		if (shouldComplete && interruptedContinuation) {
+			interruptedContinuation();
+		} else if (interruptedContinuation && !currentThreadVar->_didSyscallReturnDuringInterrupt) {
+			std::unique_lock lock(currentThreadVar->_rwlock);
+			currentThreadVar->_continuationCallback = interruptedContinuation;
+			interruptedContinuation = nullptr;
+		}
+	}
+
 	interruptedContinuation = nullptr;
 
 	{
@@ -1574,8 +1654,54 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 		}
 
 		currentThreadVar->_interruptedForSignal = false;
-		currentThreadVar->_interrupts.top().interruptedCall = nullptr;
+		/*
+		 * If the interrupted RPC did not finish during interrupt_enter, keep
+		 * interruptedCall until after InterruptEnter _sendReply, then repark
+		 * it as _activeCall. Do not invent a reply for it on interrupt_exit.
+		 */
 	}
 
 	dtape_thread_sigexc_enter2(currentThreadVar->_dtapeThread);
+};
+
+void DarlingServer::Thread::_reparkMachWaitAfterInterruptEnter() {
+	if (!currentThreadVar) {
+		return;
+	}
+
+	std::unique_lock lock(currentThreadVar->_rwlock);
+
+	if (!currentThreadVar->_interrupts.empty() && currentThreadVar->_didSyscallReturnDuringInterrupt) {
+		currentThreadVar->_interrupts.top().interruptedCall = nullptr;
+	} else if (!currentThreadVar->_interrupts.empty() && !currentThreadVar->_didSyscallReturnDuringInterrupt) {
+		auto parked = currentThreadVar->_interrupts.top().interruptedCall;
+		if (parked &&
+		    parked->number() != Call::Number::InterruptEnter &&
+		    parked->number() != Call::Number::InterruptExit) {
+			currentThreadVar->_parkedWaitCall = parked;
+		}
+		if (parked && !currentThreadVar->_activeCall) {
+			currentThreadVar->_activeCall = parked;
+		}
+		currentThreadVar->_interrupts.top().interruptedCall = nullptr;
+	}
+	if (!currentThreadVar->_activeCall && currentThreadVar->_parkedWaitCall) {
+		currentThreadVar->_activeCall = currentThreadVar->_parkedWaitCall;
+	}
+
+	if (currentThreadVar->_interruptedContinuation && !currentThreadVar->_continuationCallback) {
+		currentThreadVar->_continuationCallback = currentThreadVar->_interruptedContinuation;
+		currentThreadVar->_interruptedContinuation = nullptr;
+	}
+
+	if (currentThreadVar->_activeCall && currentThreadVar->_continuationCallback) {
+		currentThreadVar->_suspended = true;
+	}
+
+	lock.unlock();
+
+	if (currentThreadVar->_dtapeThread &&
+	    dtape_thread_sigexc_should_complete_wait(currentThreadVar->_dtapeThread)) {
+		currentThreadVar->resume();
+	}
 };

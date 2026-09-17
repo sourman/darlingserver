@@ -21,6 +21,7 @@ struct dtape_task {
 	void* p_pthhash;
 	uint64_t dyld_info_addr;
 	uint64_t dyld_info_length;
+	bool dyld_info_known;
 	dtape_mutex_t dyld_info_lock;
 	dtape_condvar_t dyld_info_condvar;
 	struct proc_ident p_ident;

@@ -100,6 +100,15 @@
 #endif
 
 #include <sys/event.h>
+#include <stddef.h>
+
+#ifdef __DARLING__
+#include <darlingserver/duct-tape/log.h>
+#include <darlingserver/duct-tape/task.h>
+#include <darlingserver/duct-tape/thread.h>
+extern void dtape_kqchan_notify_mqueue(ipc_mqueue_t mqueue);
+extern bool dtape_thread_is_kqchan_waitq_waiter(thread_t thread);
+#endif
 
 extern char     *proc_name_address(void *p);
 
@@ -442,6 +451,38 @@ ipc_mqueue_has_klist(ipc_mqueue_t mqueue)
 	}
 	return port->ip_sync_link_state == PORT_SYNC_LINK_ANY;
 }
+
+#ifdef __DARLING__
+static void
+ipc_mqueue_post_log(ipc_mqueue_t mqueue, thread_t receiver, bool has_klist, const char* knote_action)
+{
+	uint32_t port_name = 0;
+	uint32_t nsid = 0;
+	uint32_t rec_nstid = 0;
+	unsigned rcv_state = receiver ? receiver->ith_state : 0;
+	ipc_object_t object = imq_to_object(mqueue);
+
+	if (io_otype(object) == IOT_PORT) {
+		ipc_port_t port = ip_from_mq(mqueue);
+		port_name = port->ip_receiver_name;
+		if (port->ip_receiver && port->ip_receiver->is_task) {
+			dtape_task_t* task = dtape_task_for_xnu_task(port->ip_receiver->is_task);
+			if (task) {
+				nsid = task->saved_pid;
+			}
+		}
+	}
+	if (receiver) {
+		rec_nstid = (uint32_t)receiver->thread_id;
+	}
+	if (nsid != 78 && port_name != 18947 && port_name != 14083) {
+		return;
+	}
+	dtape_log_debug("ipc_mqueue_post port=%u waitq=%p receiver_nstid=%u ith_state=0x%x has_klist=%d imq_msgcount=%u knote=%s posted=%p",
+	    port_name, &mqueue->imq_wait_queue, rec_nstid, rcv_state, has_klist ? 1 : 0,
+	    mqueue->imq_msgcount, knote_action, mqueue);
+}
+#endif
 
 /*
  *	Routine:	ipc_mqueue_changed
@@ -788,42 +829,48 @@ ipc_mqueue_post(
 
 		if (receiver == THREAD_NULL) {
 			/*
-			 * no receivers; queue kmsg if space still reserved
-			 * Reservations are cancelled when the port goes inactive.
-			 * note that this will enqueue the message for any
-			 * "peeking" receivers.
-			 *
-			 * Also, post the knote to wake up any threads waiting
-			 * on that style of interface if this insertion is of
-			 * note (first insertion, or adjusted override qos all
-			 * the way to the head of the queue).
-			 *
-			 * This is just for ports. portset knotes are stay-active,
-			 * and their threads get awakened through the !MACH_RCV_IN_PROGRESS
-			 * logic below).
+			 * WaitableEvent Wait uses EVFILT_MACHPORT/kqchan, not
+			 * mach_msg_receive, so there is no waitq receiver.
+			 * Always enqueue (even when imq_msgcount==0) so kqchan
+			 * recvmsg wakes. Do not destroy. Honor enqueue_qos
+			 * failure. KNOTE only if imq_klist is a real klist
+			 * (invalid when the field is a turnstile). When the
+			 * klist is a turnstile, notify via the kqchan object.
 			 */
-			if (mqueue->imq_msgcount > 0) {
-				if (ipc_kmsg_enqueue_qos(&mqueue->imq_messages, kmsg)) {
-					/* if the space is dead there is no point calling KNOTE */
-					ipc_object_t object = imq_to_object(mqueue);
-					assert(io_otype(object) == IOT_PORT);
+			if (ipc_kmsg_enqueue_qos(&mqueue->imq_messages, kmsg)) {
+				ipc_object_t object = imq_to_object(mqueue);
+				bool did_knote = false;
+				if (io_otype(object) == IOT_PORT) {
 					ipc_port_t port = ip_object_to_port(object);
 					if (ip_active(port) &&
 					    port->ip_receiver_name != MACH_PORT_NULL &&
 					    is_active(port->ip_receiver) &&
-					    ipc_mqueue_has_klist(mqueue)) {
+					    ipc_mqueue_has_klist(mqueue) &&
+					    SLIST_FIRST(&mqueue->imq_klist)) {
 						KNOTE(&mqueue->imq_klist, 0);
+						did_knote = true;
 					}
+				} else if (ipc_mqueue_has_klist(mqueue) &&
+				    SLIST_FIRST(&mqueue->imq_klist)) {
+					KNOTE(&mqueue->imq_klist, 0);
+					did_knote = true;
 				}
-				break;
+#ifdef __DARLING__
+				/* Always wake dtape kqchans on this mqueue.
+				 * KNOTE only walks imq_klist; a turnstile-overlaid
+				 * or empty klist used to skip notify and left
+				 * bootstrap_check_in receive rights unserved. */
+				dtape_kqchan_notify_mqueue(mqueue);
+				ipc_mqueue_post_log(mqueue, THREAD_NULL, ipc_mqueue_has_klist(mqueue),
+				    did_knote ? "klist+kqchan" : "kqchan_object");
+#endif
 			}
-
-			/*
-			 * Otherwise, the message queue must belong to an inactive
-			 * port, so just destroy the message and pretend it was posted.
-			 */
-			destroy_msg = TRUE;
-			goto out_unlock;
+#ifdef __DARLING__
+			else {
+				ipc_mqueue_post_log(mqueue, THREAD_NULL, ipc_mqueue_has_klist(mqueue), "enqueue_failed");
+			}
+#endif
+			break;
 		}
 
 		/*
@@ -841,6 +888,9 @@ ipc_mqueue_post(
 			ipc_mqueue_peek_on_thread(mqueue, receiver->ith_option, receiver);
 			thread_unlock(receiver);
 			splx(th_spl);
+#ifdef __DARLING__
+			ipc_mqueue_post_log(mqueue, receiver, ipc_mqueue_has_klist(mqueue), "peek");
+#endif
 			break; /* Message was posted, so break out of loop */
 		}
 
@@ -849,12 +899,27 @@ ipc_mqueue_post(
 		 * to Mach messaging, then it isn't prepared to get handed the
 		 * message directly. Just set it running, and go look for
 		 * another thread that can.
+		 *
+		 * knote_link_waitq kernel threads must never be treated as
+		 * MACH_RCV_IN_PROGRESS waiters — they would steal the kmsg
+		 * and skip KNOTE.
 		 */
+#ifdef __DARLING__
+		if (dtape_thread_is_kqchan_waitq_waiter(receiver) ||
+		    receiver->ith_state != MACH_RCV_IN_PROGRESS) {
+			ipc_mqueue_post_log(mqueue, receiver, ipc_mqueue_has_klist(mqueue),
+			    dtape_thread_is_kqchan_waitq_waiter(receiver) ? "skip_kqchan_waiter" : "skip_non_rcv");
+			thread_unlock(receiver);
+			splx(th_spl);
+			continue;
+		}
+#else
 		if (receiver->ith_state != MACH_RCV_IN_PROGRESS) {
 			thread_unlock(receiver);
 			splx(th_spl);
 			continue;
 		}
+#endif
 
 
 		/*
@@ -893,6 +958,15 @@ ipc_mqueue_post(
 			if (MACH_NODE_VALID(node) && FPORT_VALID(mqueue->imq_fport)) {
 				flipc_msg_ack(node, mqueue, TRUE);
 			}
+#endif
+#ifdef __DARLING__
+			/*
+			 * A real mach_msg waiter took the kmsg. Still wake the
+			 * dtape knote via the kqchan object — do not treat a
+			 * turnstile-overlaid imq_klist as a klist.
+			 */
+			dtape_kqchan_notify_mqueue(mqueue);
+			ipc_mqueue_post_log(mqueue, receiver, ipc_mqueue_has_klist(mqueue), "waiter+kqchan_object");
 #endif
 			break;
 		}
@@ -937,6 +1011,19 @@ ipc_mqueue_receive_results(wait_result_t saved_wait_result)
 		return;
 
 	case THREAD_INTERRUPTED:
+#ifdef __DARLING__
+		/*
+		 * Keep a real handed-off kmsg only. ith_kmsg shares a union with
+		 * ith_ppriority/ith_qos_override; a non-NULL overlay during
+		 * MACH_RCV_IN_PROGRESS is not a kmsg. Stock XNU then sets
+		 * MACH_RCV_INTERRUPTED.
+		 */
+		if (ipc_thread_owns_kmsg(self)) {
+			dtape_log_debug("ipc_mqueue_receive_results: THREAD_INTERRUPTED but owns kmsg=%p ith_state=0x%x; keeping handed-off message",
+			    self->ith_kmsg, self->ith_state);
+			return;
+		}
+#endif
 		self->ith_state = MACH_RCV_INTERRUPTED;
 		return;
 
@@ -983,6 +1070,19 @@ ipc_mqueue_receive_continue(
 	__unused void *param,
 	wait_result_t wresult)
 {
+#ifdef __DARLING__
+	thread_t self = current_thread();
+	if (ipc_thread_owns_kmsg(self)) {
+		wresult = THREAD_AWAKENED;
+	}
+	if (wresult == THREAD_WAITING) {
+		thread_lock(self);
+		self->state |= TH_WAIT;
+		thread_unlock(self);
+		thread_block(ipc_mqueue_receive_continue);
+		/* NOTREACHED */
+	}
+#endif
 	ipc_mqueue_receive_results(wresult);
 	mach_msg_receive_continue();  /* hard-coded for now */
 }
@@ -1185,6 +1285,9 @@ ipc_mqueue_receive_on_thread(
 	if (option & MACH_PEEK_MSG) {
 		thread->ith_state = MACH_PEEK_IN_PROGRESS;
 	} else {
+#ifdef __DARLING__
+		thread->ith_kmsg = IKM_NULL;
+#endif
 		thread->ith_state = MACH_RCV_IN_PROGRESS;
 	}
 

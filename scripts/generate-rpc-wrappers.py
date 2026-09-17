@@ -184,7 +184,7 @@ calls = [
 
 	('interrupt_enter', [], [], PUSH_UNKNOWN_REPLIES),
 
-	('interrupt_exit', [], []),
+	('interrupt_exit', [], [], PUSH_UNKNOWN_REPLIES),
 
 	('console_open', [], [
 		('console', '@fd'),
@@ -222,9 +222,9 @@ calls = [
 		# these are in/out pointers
 		('thread_state', 'uint64_t'),
 		('float_state', 'uint64_t'),
-	], []),
+	], [], PUSH_UNKNOWN_REPLIES),
 
-	('s2c_perform', [], []),
+	('s2c_perform', [], [], PUSH_UNKNOWN_REPLIES),
 
 	('set_executable_path', [
 		('buffer', 'const char*', 'uint64_t'),
@@ -643,6 +643,22 @@ calls = [
 		('message_count', 'uint64_t'),
 		('fd', '@fd'),
 	], UNMANAGED_CALL),
+
+	#
+	# Mach fileports (wrap a Linux fd in an IKOT_FILEPORT send right)
+	#
+
+	('fileport_makeport', [
+		('fd', '@fd'),
+	], [
+		('port_name', 'uint32_t'),
+	]),
+
+	('fileport_makefd', [
+		('port_name', 'uint32_t'),
+	], [
+		('fd', '@fd'),
+	]),
 ]
 
 ALLOWED_PRIVATE_TYPES = [

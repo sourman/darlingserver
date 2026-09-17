@@ -27,6 +27,7 @@
 #include <darlingserver/config.hpp>
 #include <sys/fcntl.h>
 #include <sys/syscall.h>
+#include <errno.h>
 #include <darlingserver/kqchan.hpp>
 
 static DarlingServer::Log callLog("calls");
@@ -148,49 +149,67 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		// (used to send interrupted replies back to the server)
 
 		auto pushReplyCall = reinterpret_cast<const dserver_rpc_call_push_reply_t*>(requestMessage.data().data());
-		Message replyToSave(pushReplyCall->reply_size, 0);
-
-		// extract the reply-push synchronization pipe
-		auto pipeDesc = requestMessage.extractDescriptorAtIndex(requestMessage.descriptors().size() - 1);
+		int pipeDesc = -1;
 		char tmp = 1;
 
-		if (pipeDesc < 0) {
-			throw std::runtime_error("Failed to extract reply-push synchronization pipe");
-		}
-
-		if (!process->readMemory(pushReplyCall->reply, replyToSave.data().data(), pushReplyCall->reply_size)) {
-			throw std::runtime_error("Failed to read client-pushed reply body");
-		}
-
-		replyToSave.replaceDescriptors(requestMessage.descriptors());
-		requestMessage.replaceDescriptors({});
-
-		replyToSave.setAddress(requestMessage.address());
-
-		{
-			std::unique_lock lock(thread->_rwlock);
-			if (thread->_pendingCall && thread->_pendingCall->number() == Call::Number::InterruptEnter) {
-				// this means the client got interrupted after we had already sent a reply for the interrupted call,
-				// the client saw this unexpected reply while waiting for interrupt_enter to respond and sent it back to us,
-				// and we received both calls (interrupt_enter and push_reply) at the same time
-				thread->_pendingSavedReply = std::move(replyToSave);
-			} else {
-				if (thread->_interrupts.empty()) {
-					throw std::runtime_error("Client tried to push reply outside of interrupt");
-				}
-				if (thread->_interrupts.top().savedReply) {
-					throw std::runtime_error("Client-pushed reply overwriting existing saved reply");
-				}
-				thread->_interrupts.top().savedReply = std::move(replyToSave);
+		try {
+			pipeDesc = requestMessage.extractDescriptorAtIndex(requestMessage.descriptors().size() - 1);
+			if (pipeDesc < 0) {
+				callLog.error() << "Failed to extract reply-push synchronization pipe" << callLog.endLog;
+				return nullptr;
 			}
+
+			Message replyToSave(pushReplyCall->reply_size, 0);
+
+			if (!process->readMemory(pushReplyCall->reply, replyToSave.data().data(), pushReplyCall->reply_size)) {
+				callLog.error() << "Failed to read client-pushed reply body" << callLog.endLog;
+			} else {
+				replyToSave.replaceDescriptors(requestMessage.descriptors());
+				requestMessage.replaceDescriptors({});
+
+				replyToSave.setAddress(requestMessage.address());
+
+				{
+					std::unique_lock lock(thread->_rwlock);
+					if (thread->_pendingCall && thread->_pendingCall->number() == Call::Number::InterruptEnter) {
+						// this means the client got interrupted after we had already sent a reply for the interrupted call,
+						// the client saw this unexpected reply while waiting for interrupt_enter to respond and sent it back to us,
+						// and we received both calls (interrupt_enter and push_reply) at the same time
+						thread->_pendingSavedReply = std::move(replyToSave);
+						callLog.debug() << *thread << ": Saved client-pushed reply (pending InterruptEnter)" << callLog.endLog;
+					} else if (thread->_interrupts.empty()) {
+						if (thread->_pendingCall && thread->_pendingCall->number() == Call::Number::InterruptExit) {
+							/* InterruptExit has not _sendReply(0) yet; it will resend this after that. */
+							thread->_pendingSavedReply = std::move(replyToSave);
+							callLog.debug() << *thread << ": Saved client-pushed reply (pending InterruptExit)" << callLog.endLog;
+						} else if (thread->_activeCall) {
+							thread->_pendingSavedReply = std::move(replyToSave);
+							callLog.info() << *thread << ": Overwriting pending saved reply (parked _activeCall)" << callLog.endLog;
+						} else {
+							/* Interrupt stack already empty and nothing parked: send NOW.
+							 * InterruptExit already finished; SA_RESTART outer recvmsg needs this reply. */
+							callLog.info() << *thread << ": push_reply immediate send" << callLog.endLog;
+							Server::sharedInstance().sendMessage(std::move(replyToSave));
+						}
+					} else {
+						if (thread->_interrupts.top().savedReply) {
+							callLog.info() << *thread << ": Overwriting saved reply with latest push_reply" << callLog.endLog;
+						}
+						thread->_interrupts.top().savedReply = std::move(replyToSave);
+						callLog.debug() << *thread << ": Saved client-pushed reply (normal)" << callLog.endLog;
+					}
+				}
+			}
+		} catch (const std::exception& e) {
+			callLog.error() << "push_reply: " << e.what() << callLog.endLog;
+		} catch (...) {
+			callLog.error() << "push_reply: unknown exception" << callLog.endLog;
 		}
 
-		callLog.debug() << *thread << ": Saved client-pushed reply (" << ((thread->_pendingSavedReply) ? "pending" : "normal") << ")" << callLog.endLog;
-
-		// write a byte to the pipe so the caller can continue
-		write(pipeDesc, &tmp, sizeof(tmp));
-		// and close it
-		close(pipeDesc);
+		if (pipeDesc >= 0) {
+			write(pipeDesc, &tmp, sizeof(tmp));
+			close(pipeDesc);
+		}
 
 		return nullptr;
 	}
@@ -648,14 +667,13 @@ void DarlingServer::Call::KqchanMachPortOpen::processCall() {
 
 			try {
 				socket = kqchan->setup();
+				process->registerKqchan(kqchan);
 			} catch (std::system_error e) {
 				code = -e.code().value();
 			} catch (...) {
 				// just report that we couldn't find the port
 				code = -ESRCH;
 			}
-
-			process->registerKqchan(kqchan);
 		} else {
 			code = -ESRCH;
 		}
@@ -743,9 +761,16 @@ void DarlingServer::Call::TaskIs64Bit::processCall() {
 };
 
 void DarlingServer::Call::InterruptEnter::processCall() {
-	Thread::_handleInterruptEnterForCurrentThread();
+	try {
+		Thread::_handleInterruptEnterForCurrentThread();
+	} catch (const std::exception& e) {
+		callLog.error() << "InterruptEnter: " << e.what() << callLog.endLog;
+	} catch (...) {
+		callLog.error() << "InterruptEnter: unknown exception" << callLog.endLog;
+	}
 
 	_sendReply(0);
+	Thread::_reparkMachWaitAfterInterruptEnter();
 };
 
 void DarlingServer::Call::InterruptExit::processCall() {
@@ -753,21 +778,118 @@ void DarlingServer::Call::InterruptExit::processCall() {
 
 	dtape_thread_sigexc_exit(thread->_dtapeThread);
 
+	// Reply to interrupt_exit first. SA_RESTART then restarts the client's
+	// original recvmsg on the same RPC socket; any saved/pending reply must
+	// follow this message, not replace it. Never a second interrupt_exit 0.
 	_sendReply(0);
+
+	dtape_thread_wait_info_t waitInfo {};
+	dtape_thread_get_wait_info(thread->_dtapeThread, &waitInfo);
+	const bool machWaiting = dtape_thread_sigexc_is_waiting(thread->_dtapeThread) || waitInfo.owns_kmsg || waitInfo.waiting;
+
+	bool sentAfter = false;
+	bool hadSaved = false;
+	bool hadPending = false;
+	bool hadActive = false;
+	bool hadParked = false;
+	bool reparkNoReply = false;
+	bool poppedEmpty = false;
+	size_t depthBefore = 0;
+	size_t depthAfter = 0;
+	const char* activeName = "none";
+	const char* classify = "empty-pop";
 
 	{
 		std::unique_lock lock(thread->_rwlock);
 
-		auto tmp = std::move(thread->_interrupts.top());
+		depthBefore = thread->_interrupts.size();
+		hadPending = thread->_pendingSavedReply.has_value();
+		hadParked = !!thread->_parkedWaitCall;
+		hadActive = !!thread->_activeCall;
+		if (thread->_activeCall) {
+			activeName = Call::callNumberToString(thread->_activeCall->number());
+		}
 
-		thread->_interrupts.pop();
+		reparkNoReply = machWaiting || hadParked ||
+			(thread->_activeCall &&
+			 thread->_activeCall->number() != Call::Number::InterruptEnter &&
+			 thread->_activeCall->number() != Call::Number::InterruptExit);
 
-		if (tmp.savedReply) {
-			callLog.debug() << *thread << ": Going to send saved reply" << callLog.endLog;
-			Server::sharedInstance().sendMessage(std::move(*tmp.savedReply));
-			tmp.savedReply = std::nullopt;
+		if (thread->_interrupts.empty()) {
+			poppedEmpty = true;
+		} else {
+			auto tmp = std::move(thread->_interrupts.top());
+			thread->_interrupts.pop();
+			hadSaved = tmp.savedReply.has_value();
+
+			if (tmp.savedReply) {
+				if (reparkNoReply || thread->_activeCall) {
+					/* Parked Mach wait: keep the reply, do not complete the receive. */
+					if (!thread->_pendingSavedReply) {
+						thread->_pendingSavedReply = std::move(*tmp.savedReply);
+					}
+					hadPending = true;
+				} else {
+					callLog.debug() << *thread << ": Going to send saved reply" << callLog.endLog;
+					Server::sharedInstance().sendMessage(std::move(*tmp.savedReply));
+					sentAfter = true;
+				}
+			}
+		}
+
+		/*
+		 * Resend a pushed reply only when nothing is parked. THREAD_WAITING /
+		 * owns_kmsg / parkedWait → repark, no extra reply. True empty pop:
+		 * only the interrupt_exit 0 already sent.
+		 */
+		if (!sentAfter && !reparkNoReply && thread->_pendingSavedReply && thread->_interrupts.empty() &&
+		    !thread->_activeCall && !thread->_parkedWaitCall) {
+			callLog.info() << *thread << ": Going to send pending saved reply" << callLog.endLog;
+			Server::sharedInstance().sendMessage(std::move(*thread->_pendingSavedReply));
+			thread->_pendingSavedReply = std::nullopt;
+			sentAfter = true;
+			hadPending = true;
+		}
+
+		depthAfter = thread->_interrupts.size();
+		if (!thread->_activeCall && thread->_parkedWaitCall) {
+			thread->_activeCall = thread->_parkedWaitCall;
+		}
+		hadActive = !!thread->_activeCall;
+		if (thread->_activeCall) {
+			activeName = Call::callNumberToString(thread->_activeCall->number());
+		}
+		hadPending = thread->_pendingSavedReply.has_value();
+		hadParked = !!thread->_parkedWaitCall;
+
+		if (reparkNoReply) {
+			classify = "repark";
+		} else if (sentAfter) {
+			classify = "pending-resend";
+		} else {
+			classify = "empty-pop";
 		}
 	}
+
+	callLog.info() << *thread << ": InterruptExit nstid=" << thread->nsid()
+		<< " depth=" << depthBefore << "->" << depthAfter
+		<< " classify=" << classify
+		<< " savedReply=" << (hadSaved ? "yes" : "no")
+		<< " pendingSavedReply=" << (hadPending ? "yes" : "no")
+		<< " parkedWait=" << (hadParked ? "yes" : "no")
+		<< " machWaiting=" << (machWaiting ? "yes" : "no")
+		<< " activeCall=" << activeName
+		<< " sentAfter=" << (sentAfter ? "savedReply" : "none")
+		<< callLog.endLog;
+
+	if (poppedEmpty && !sentAfter && !reparkNoReply) {
+		callLog.info() << *thread << ": InterruptExit true empty pop; only interrupt_exit 0"
+			<< callLog.endLog;
+	}
+
+	Server::sharedInstance().rearmInbox();
+
+	Thread::_reparkMachWaitAfterInterruptEnter();
 };
 
 void DarlingServer::Call::ConsoleOpen::processCall() {
@@ -1184,6 +1306,27 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 	}
 
 	_sendReply(code, portCount, pipes[0]);
+};
+
+void DarlingServer::Call::FileportMakeport::processCall() {
+	int code = 0;
+	uint32_t name = 0;
+	int fd = _body.fd;
+
+	if (fd < 0) {
+		code = EBADF;
+	} else {
+		_body.fd = -1;
+		code = dtape_fileport_makeport(fd, &name);
+	}
+
+	_sendReply(code, name);
+};
+
+void DarlingServer::Call::FileportMakefd::processCall() {
+	int fd = -1;
+	int code = dtape_fileport_makefd(_body.port_name, &fd);
+	_sendReply(code, fd);
 };
 
 DSERVER_CLASS_SOURCE_DEFS;
