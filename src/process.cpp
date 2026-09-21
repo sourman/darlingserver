@@ -32,6 +32,9 @@
 
 static DarlingServer::Log processLog("process");
 
+__attribute__((used)) static const char notify_checkin_null_sem_v1[] =
+	"notify_checkin_null_sem_v1";
+
 DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int pipe):
 	_pid(id),
 	_nspid(nsid),
@@ -370,7 +373,12 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	} else {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
-			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			if (parent->_dtapeForkWaitSemaphore) {
+				dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			} else {
+				processLog.warning() << *this << ": notifyCheckin skipped null parent fork-wait semaphore ("
+					<< notify_checkin_null_sem_v1 << ")" << processLog.endLog;
+			}
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
 		}
 	}
@@ -740,21 +748,20 @@ void DarlingServer::Process::notifyDead() {
 	// TODO: get exit status
 	_notifyListeningKqchannels(NOTE_EXIT, 0);
 
-	dtape_task_dying(_dtapeTask);
+	// ipc_space_terminate → ipc_port_destroy reads current_thread()->ith_assertions.
+	// The epoll thread has no microthread TLS, so that is a NULL deref (SIGSEGV).
+	// Run dying + release on a kernelAsync runner (same pool as kqchan MachPort _read).
+	Thread::kernelAsync([self = shared_from_this(), threads]() {
+		dtape_task_dying(self->_dtapeTask);
 
-	// notify all our threads that we're dead
-	for (auto [id, maybeThread]: threads) {
-		auto thread = maybeThread.lock();
-		if (!thread) {
-			continue;
+		for (auto [id, maybeThread]: threads) {
+			auto thread = maybeThread.lock();
+			if (!thread) {
+				continue;
+			}
+			thread->notifyDead();
 		}
-		thread->notifyDead();
-	}
 
-	// schedule the duct-taped task to be released
-	// dtape_thread_release needs a microthread context, so we call it within a kernel microthread
-	// also destroy the fork-wait semaphore here
-	Thread::kernelAsync([self = shared_from_this()]() {
 		if (self->_dtapeForkWaitSemaphore) {
 			dtape_semaphore_destroy(self->_dtapeForkWaitSemaphore);
 			self->_dtapeForkWaitSemaphore = nullptr;

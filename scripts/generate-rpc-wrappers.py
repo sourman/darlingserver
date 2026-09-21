@@ -659,6 +659,18 @@ calls = [
 	], [
 		('fd', '@fd'),
 	]),
+
+	# Append-only: do not insert in the middle (shifts call numbers).
+	('mach_port_peek', [
+		('target', 'uint32_t'),
+		('name', 'uint32_t'),
+		('trailer_type', 'uint32_t'),
+		('seqnop', 'uint32_t*', 'uint64_t'),
+		('msg_sizep', 'uint32_t*', 'uint64_t'),
+		('msg_idp', 'int32_t*', 'uint64_t'),
+		('trailer_infop', 'void*', 'uint64_t'),
+		('trailer_sizep', 'uint32_t*', 'uint64_t'),
+	], [], XNU_TRAP_CALL | XNU_TRAP_NOSUFFIX_ARGS),
 ]
 
 ALLOWED_PRIVATE_TYPES = [

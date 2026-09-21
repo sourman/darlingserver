@@ -22,6 +22,7 @@ typedef struct dtape_map_shared_entry {
 	uint64_t size;
 	uint64_t page_offset;
 	dtape_map_shared_descriptor_t* descriptor;
+	unsigned map_refs;
 } dtape_map_shared_entry_t;
 
 typedef RB_HEAD(dtape_map_shared_entry_head, dtape_map_shared_entry) dtape_map_shared_entry_head_t;

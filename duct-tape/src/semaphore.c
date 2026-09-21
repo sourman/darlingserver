@@ -55,6 +55,11 @@ bool dtape_semaphore_down_simple(dtape_semaphore_t* semaphore) {
 		case dtape_semaphore_wait_result_interrupted:
 			return false;
 		default:
-			panic("Failed to lower up-count of duct-taped XNU semaphore");
+			/*
+			 * Guest abort during S2C mmap destroys the wait semaphore.
+			 * Panic here killed dserver after keep_va pins; return
+			 * interrupted so _s2cPerform unwinds instead of dying.
+			 */
+			return false;
 	}
 };

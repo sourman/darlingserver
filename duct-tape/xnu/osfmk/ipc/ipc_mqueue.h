@@ -314,6 +314,10 @@ extern unsigned ipc_mqueue_peek(
 	mach_msg_max_trailer_t  *msg_trailerp,
 	ipc_kmsg_t              *kmsgp);
 
+/* Count kmsgs actually sitting on the port mqueue (imq lock held). */
+extern mach_port_msgcount_t ipc_mqueue_queued_msgcount(
+	ipc_mqueue_t            mqueue);
+
 /* Peek into a locked messaqe queue to see if there are messages */
 extern unsigned ipc_mqueue_peek_locked(
 	ipc_mqueue_t            mqueue,
@@ -360,5 +364,12 @@ extern mach_msg_return_t ipc_mqueue_copyin(
 	mach_port_name_t        name,
 	ipc_mqueue_t            *mqueuep,
 	ipc_object_t            *objectp);
+
+#ifdef __DARLING__
+void dtape_note_gpu_channel_mqueue(ipc_mqueue_t mqueue, uint32_t pid);
+uint32_t dtape_gpu_channel_mqueue_pid(ipc_mqueue_t mqueue);
+void dtape_note_net_channel_mqueue(ipc_mqueue_t mqueue, uint32_t pid);
+uint32_t dtape_net_channel_mqueue_pid(ipc_mqueue_t mqueue);
+#endif
 
 #endif  /* _IPC_IPC_MQUEUE_H_ */

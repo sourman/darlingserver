@@ -114,6 +114,21 @@
 #include <ipc/ipc_hash.h>
 #include <ipc/ipc_table.h>
 #include <ipc/ipc_importance.h>
+#include <ipc/ipc_mqueue.h>
+#ifdef __DARLING__
+#include <darlingserver/duct-tape/log.h>
+#include <darlingserver/duct-tape/task.h>
+
+#ifdef __DARLING__
+extern int dtape_fileport_peek_fd(void *kobject);
+extern int dtape_host_cmdline_is_network(unsigned nsid);
+extern int dtape_host_cmdline_is_storage(unsigned nsid);
+static void dtape_pong_note_copyin(ipc_kmsg_t kmsg, mach_port_name_t dest_name_before,
+    mach_msg_return_t mr);
+static void dtape_pong_note_copyout(ipc_kmsg_t kmsg, mach_msg_return_t mr, int attempted);
+static void dtape_pong_note_send_error(ipc_kmsg_t kmsg, ipc_port_t port, mach_msg_return_t error);
+#endif
+#endif
 #if MACH_FLIPC
 #include <kern/mach_node.h>
 #include <ipc/flipc.h>
@@ -2335,6 +2350,9 @@ retry:
 
 		error = ipc_mqueue_send(&port->ip_messages, kmsg, option,
 		    send_timeout);
+#ifdef __DARLING__
+		dtape_pong_note_send_error(kmsg, port, error);
+#endif
 	}
 
 #if IMPORTANCE_INHERITANCE
@@ -2412,6 +2430,1397 @@ retry:
 	return error;
 }
 
+#ifdef __DARLING__
+static boolean_t dtape_copyout_legacy_header(void);
+extern void dtape_bypass34_note_seq4_copyin(ipc_kmsg_t kmsg);
+extern void dtape_bypass34_note_seq4_copyout(ipc_kmsg_t kmsg);
+extern void dtape_bypass34_note_reply_copyin(ipc_kmsg_t kmsg);
+extern void dtape_gpu_hs20_note_copyout(void);
+extern int dtape_ipcz_is_childprocess_ping(const mach_msg_header_t *hdr, int user_hdr);
+extern int dtape_ipcz_is_childprocess_pong(const mach_msg_header_t *hdr, int user_hdr);
+static int dtape_mojo_from_ipcz(const unsigned char *imsg, mach_msg_size_t avail,
+    uint32_t *iid, uint32_t *flags);
+extern void dtape_rls_frag_copyout_note(uint32_t frag_off);
+extern void dtape_rls_accept_peek(uint64_t sublink, uint32_t seq);
+extern void dtape_rls_fe_observe(const char *why, unsigned msgid, uint32_t frag_off);
+extern void dtape_nodelink_invite_dump(const char *why, uint32_t dest_nsid);
+extern void dtape_inbound_flush_before_34(void);
+static void dtape_helper_fifo_peek(ipc_kmsg_t ping, uint64_t ping_sl,
+    mach_port_name_t recv_name);
+int dtape_ipcz_peek(const mach_msg_header_t *hdr, int user_hdr,
+    unsigned *msgid_out, unsigned *seq_out, uint64_t *sublink_out);
+static void dtape_pong_note_copyin(ipc_kmsg_t kmsg, mach_port_name_t dest_name_before,
+    mach_msg_return_t mr);
+static void dtape_pong_note_copyout(ipc_kmsg_t kmsg, mach_msg_return_t mr, int attempted);
+static void dtape_pong_note_send_error(ipc_kmsg_t kmsg, ipc_port_t port, mach_msg_return_t error);
+
+__attribute__((used)) static const char dtape_helper_34_vs_ping_v1[] =
+	"helper_34_vs_ping_v1";
+__attribute__((used)) static const char dtape_helper_fifo_peek_legacy_v1[] =
+	"helper_fifo_peek_legacy_v1";
+
+/*
+ * After ipc_kmsg_put's LP64→legacy rewrite, ikm_header is a 24-byte
+ * user header. Reading msgh_local_port as ipc_port_t pulls MOJO magic
+ * (0x4d4f4a4f00000000). imq_lock → ipc_object_validate SIGSEGV'd
+ * prefix dserver 1588179 during storage Ping copyout. GPU ROOT98 was
+ * concurrent; last Darling log was not the death. Look up the
+ * receive right by name (g_ping_dest_name / rcv_name) instead.
+ * Keep fifo head. Do not rotate. Do not dest-bind.
+ */
+static void
+dtape_helper_fifo_peek(ipc_kmsg_t ping, uint64_t ping_sl,
+    mach_port_name_t recv_name)
+{
+	ipc_port_t port = IP_NULL;
+	ipc_space_t space = IS_NULL;
+	ipc_entry_t entry;
+	ipc_kmsg_t k;
+	unsigned n = 0;
+	unsigned n34 = 0;
+	unsigned first_msgid = 0xffffffffu;
+	uint64_t first_sl = ~(uint64_t)0;
+	int queued;
+	int space_locked = 0;
+
+	(void)dtape_helper_34_vs_ping_v1;
+	(void)dtape_helper_fifo_peek_legacy_v1;
+	if (ping == IKM_NULL || ping->ikm_header == NULL) {
+		return;
+	}
+	if (dtape_copyout_legacy_header()) {
+		if (!MACH_PORT_VALID(recv_name)) {
+			dtape_log_error(
+			    "helper_fifo_peek_legacy_v1 ping_sl=%llu name=0x%x skip",
+			    (unsigned long long)ping_sl, recv_name);
+			return;
+		}
+		space = current_space();
+		if (space == IS_NULL) {
+			dtape_log_error(
+			    "helper_fifo_peek_legacy_v1 ping_sl=%llu name=0x%x no_space",
+			    (unsigned long long)ping_sl, recv_name);
+			return;
+		}
+		if (ipc_right_lookup_write(space, recv_name, &entry) != KERN_SUCCESS) {
+			dtape_log_error(
+			    "helper_fifo_peek_legacy_v1 ping_sl=%llu name=0x%x lookup_fail",
+			    (unsigned long long)ping_sl, recv_name);
+			return;
+		}
+		space_locked = 1;
+		if (entry->ie_object == IO_NULL) {
+			is_write_unlock(space);
+			dtape_log_error(
+			    "helper_fifo_peek_legacy_v1 ping_sl=%llu name=0x%x no_object",
+			    (unsigned long long)ping_sl, recv_name);
+			return;
+		}
+		port = ip_object_to_port(entry->ie_object);
+		dtape_log_error(
+		    "helper_fifo_peek_legacy_v1 ping_sl=%llu name=0x%x port=%p",
+		    (unsigned long long)ping_sl, recv_name, (void *)port);
+	} else {
+		port = ping->ikm_header->msgh_local_port;
+	}
+	if (!IP_VALID(port) ||
+	    (uintptr_t)port < 0x1000ull ||
+	    (uintptr_t)port > 0x00007fffffffffffull) {
+		if (space_locked) {
+			is_write_unlock(space);
+		}
+		dtape_log_error(
+		    "helper_34_vs_ping_v1 fifo ping_sl=%llu port_invalid p=%p name=0x%x",
+		    (unsigned long long)ping_sl, (void *)port, recv_name);
+		return;
+	}
+	imq_lock(&port->ip_messages);
+	queued = (int)ipc_mqueue_queued_msgcount(&port->ip_messages);
+	k = ipc_kmsg_queue_first(&port->ip_messages.imq_messages);
+	while (k != IKM_NULL && n < 12) {
+		unsigned msgid = 0, seq = 0;
+		uint64_t sl = ~(uint64_t)0;
+
+		(void)dtape_ipcz_peek(k->ikm_header, 0, &msgid, &seq, &sl);
+		if (msgid == 0) {
+			(void)dtape_ipcz_peek(k->ikm_header, 1, &msgid, &seq, &sl);
+		}
+		if (n == 0) {
+			first_msgid = msgid;
+			first_sl = sl;
+		}
+		if (msgid == 34) {
+			n34++;
+		}
+		dtape_log_error(
+		    "helper_34_vs_ping_v1 fifo i=%u msgid=%u sl=%llu seq=%u ping_sl=%llu",
+		    n, msgid, (unsigned long long)sl, seq,
+		    (unsigned long long)ping_sl);
+		k = ipc_kmsg_queue_next(&port->ip_messages.imq_messages, k);
+		n++;
+	}
+	imq_unlock(&port->ip_messages);
+	if (space_locked) {
+		is_write_unlock(space);
+	}
+	dtape_log_error(
+	    "helper_34_vs_ping_v1 fifo_head msgid=%u sl=%llu n=%u n34=%u queued=%d ping_sl=%llu rotate=0",
+	    first_msgid, (unsigned long long)first_sl, n, n34, queued,
+	    (unsigned long long)ping_sl);
+}
+
+/*
+ * Kernel or legacy user header. msgid 20 sequence lives at msg+40;
+ * BypassPeerWithLink is msgid 34.
+ */
+int
+dtape_ipcz_peek(const mach_msg_header_t *hdr, int user_hdr,
+    unsigned *msgid_out, unsigned *seq_out, uint64_t *sublink_out)
+{
+	const unsigned char *base, *ipcz, *msg;
+	mach_msg_size_t hsz, ndesc, desc_sz, off, msg_size, avail;
+	uint32_t bits, id, num_bytes, proto;
+	uint64_t u64, sublink;
+	uint16_t ipcz_size, num_handles;
+	unsigned char msgid;
+
+	if (hdr == NULL) {
+		return 0;
+	}
+	base = (const unsigned char *)hdr;
+	memcpy(&bits, base, 4);
+	memcpy(&msg_size, base + 4, 4);
+	if (user_hdr) {
+		memcpy(&id, base + 20, 4);
+	} else {
+		memcpy(&id, base + 28, 4);
+	}
+	if (id != 0x4d4f4a4f && id != 0x4d4f4a2b) {
+		return 0;
+	}
+	hsz = user_hdr ? (mach_msg_size_t)sizeof(mach_msg_legacy_header_t) :
+	    (mach_msg_size_t)sizeof(mach_msg_header_t);
+	ndesc = 0;
+	if (msg_size >= hsz + sizeof(mach_msg_body_t)) {
+		const mach_msg_body_t *body = (const mach_msg_body_t *)(base + hsz);
+
+		ndesc = body->msgh_descriptor_count;
+	}
+	desc_sz = ndesc * (user_hdr ? 12u : 16u);
+	off = hsz + (mach_msg_size_t)sizeof(mach_msg_body_t) + desc_sz;
+	if (off + 8 > msg_size) {
+		return 0;
+	}
+	memcpy(&u64, base + off, 8);
+	ipcz = base + off + 8;
+	avail = msg_size - off - 8;
+	ipcz_size = 0;
+	num_handles = 0;
+	num_bytes = 0;
+	if (avail >= 8) {
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_handles, ipcz + 2, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	if (ipcz_size != 16 && (u64 & 0xffffull) == 16) {
+		ipcz = base + off;
+		avail = msg_size - off;
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_handles, ipcz + 2, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	msgid = 0xff;
+	proto = 0xffffffffu;
+	sublink = ~(uint64_t)0;
+	if (ipcz != NULL && ipcz_size >= 8 && avail >= (mach_msg_size_t)ipcz_size + 24) {
+		msg = ipcz + ipcz_size;
+		msgid = msg[2];
+		if (msgid == 20 && avail >= (mach_msg_size_t)ipcz_size + 48) {
+			memcpy(&sublink, msg + 32, 8);
+			memcpy(&proto, msg + 40, 4);
+		}
+	}
+	if (msgid_out) {
+		*msgid_out = msgid;
+	}
+	if (seq_out) {
+		*seq_out = proto;
+	}
+	if (sublink_out) {
+		*sublink_out = sublink;
+	}
+	(void)bits;
+	(void)num_handles;
+	return 1;
+}
+
+int
+dtape_ipcz_is_childprocess_ping(const mach_msg_header_t *hdr, int user_hdr)
+{
+	unsigned msgid = 0, seq = 0;
+	uint64_t sub = 0;
+	const unsigned char *base;
+	mach_msg_size_t hsz, ndesc, desc_sz, off, msg_size, avail;
+	uint32_t bits, num_bytes;
+	uint64_t u64;
+	uint16_t ipcz_size, num_handles;
+	const unsigned char *ipcz;
+
+	if (!dtape_ipcz_peek(hdr, user_hdr, &msgid, &seq, &sub) ||
+	    msgid != 20 || sub != 2) {
+		return 0;
+	}
+	if (hdr == NULL) {
+		return 0;
+	}
+	base = (const unsigned char *)hdr;
+	memcpy(&bits, base, 4);
+	memcpy(&msg_size, base + 4, 4);
+	hsz = user_hdr ? (mach_msg_size_t)sizeof(mach_msg_legacy_header_t) :
+	    (mach_msg_size_t)sizeof(mach_msg_header_t);
+	ndesc = 0;
+	if (msg_size >= hsz + sizeof(mach_msg_body_t)) {
+		const mach_msg_body_t *body = (const mach_msg_body_t *)(base + hsz);
+
+		ndesc = body->msgh_descriptor_count;
+	}
+	desc_sz = ndesc * (user_hdr ? 12u : 16u);
+	off = hsz + (mach_msg_size_t)sizeof(mach_msg_body_t) + desc_sz;
+	if (off + 8 > msg_size) {
+		return 0;
+	}
+	memcpy(&u64, base + off, 8);
+	ipcz = base + off + 8;
+	avail = msg_size - off - 8;
+	ipcz_size = 0;
+	num_handles = 0;
+	num_bytes = 0;
+	if (avail >= 8) {
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_handles, ipcz + 2, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	if (ipcz_size != 16 && (u64 & 0xffffull) == 16 && avail + 8 >= 8) {
+		ipcz = base + off;
+		avail = msg_size - off;
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_handles, ipcz + 2, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	(void)bits;
+	if (num_bytes != 184 || ipcz_size < 8 ||
+	    avail < (mach_msg_size_t)ipcz_size + 24) {
+		return num_bytes == 184;
+	}
+	{
+		uint32_t iid = 0xffffffffu, mojo_flags = 0xffffffffu;
+		const unsigned char *imsg = ipcz + ipcz_size;
+
+		if (dtape_mojo_from_ipcz(imsg, avail - ipcz_size, &iid,
+		    &mojo_flags)) {
+			return iid == 0 && (mojo_flags & 1u) != 0;
+		}
+	}
+	return 1;
+}
+
+/*
+ * EnsureConnected Ping is flags=1 iid=0 nb=184 on a post-bypass
+ * dynamic sublink (sl=23 storage, sl=29/2 network). sl=2 is not
+ * required. Do not use this for hold-34 / seq4 tracking.
+ */
+static int
+dtape_ipcz_is_mojo_ping(const mach_msg_header_t *hdr, int user_hdr)
+{
+	unsigned msgid = 0, seq = 0;
+	uint64_t sub = 0;
+	const unsigned char *base;
+	mach_msg_size_t hsz, ndesc, desc_sz, off, msg_size, avail;
+	uint32_t bits, num_bytes, iid, mojo_flags;
+	uint64_t u64;
+	uint16_t ipcz_size;
+	const unsigned char *ipcz;
+
+	if (!dtape_ipcz_peek(hdr, user_hdr, &msgid, &seq, &sub) ||
+	    msgid != 20 || hdr == NULL) {
+		return 0;
+	}
+	base = (const unsigned char *)hdr;
+	memcpy(&bits, base, 4);
+	memcpy(&msg_size, base + 4, 4);
+	hsz = user_hdr ? (mach_msg_size_t)sizeof(mach_msg_legacy_header_t) :
+	    (mach_msg_size_t)sizeof(mach_msg_header_t);
+	ndesc = 0;
+	if (msg_size >= hsz + sizeof(mach_msg_body_t)) {
+		const mach_msg_body_t *body =
+		    (const mach_msg_body_t *)(base + hsz);
+
+		ndesc = body->msgh_descriptor_count;
+	}
+	desc_sz = ndesc * (user_hdr ? 12u : 16u);
+	off = hsz + (mach_msg_size_t)sizeof(mach_msg_body_t) + desc_sz;
+	if (off + 8 > msg_size) {
+		return 0;
+	}
+	memcpy(&u64, base + off, 8);
+	ipcz = base + off + 8;
+	avail = msg_size - off - 8;
+	ipcz_size = 0;
+	num_bytes = 0;
+	if (avail >= 8) {
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	if (ipcz_size != 16 && (u64 & 0xffffull) == 16) {
+		ipcz = base + off;
+		avail = msg_size - off;
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	(void)bits;
+	if (num_bytes != 184 || ipcz_size < 8 ||
+	    avail < (mach_msg_size_t)ipcz_size + 24) {
+		return 0;
+	}
+	iid = 0xffffffffu;
+	mojo_flags = 0xffffffffu;
+	if (!dtape_mojo_from_ipcz(ipcz + ipcz_size, avail - ipcz_size,
+	    &iid, &mojo_flags)) {
+		return 0;
+	}
+	return iid == 0 && (mojo_flags & 1u) != 0;
+}
+
+__attribute__((used)) static const char dtape_pong_reply_path_v1[] = "pong_reply_path_v1";
+__attribute__((used)) static const char dtape_helper_rx_ping_v1[] = "helper_rx_ping_v1";
+__attribute__((used)) static const char dtape_browser_pong_after_helper_ping_v1[] =
+	"browser_pong_after_helper_ping_v1";
+
+static uint32_t
+dtape_ipcz_num_bytes(const mach_msg_header_t *hdr, int user_hdr)
+{
+	const unsigned char *base;
+	mach_msg_size_t hsz, ndesc, desc_sz, off, msg_size, avail;
+	uint32_t bits, num_bytes;
+	uint64_t u64;
+	uint16_t ipcz_size, num_handles;
+	const unsigned char *ipcz;
+
+	if (hdr == NULL) {
+		return 0;
+	}
+	base = (const unsigned char *)hdr;
+	memcpy(&bits, base, 4);
+	memcpy(&msg_size, base + 4, 4);
+	hsz = user_hdr ? (mach_msg_size_t)sizeof(mach_msg_legacy_header_t) :
+	    (mach_msg_size_t)sizeof(mach_msg_header_t);
+	ndesc = 0;
+	if (msg_size >= hsz + sizeof(mach_msg_body_t)) {
+		const mach_msg_body_t *body = (const mach_msg_body_t *)(base + hsz);
+
+		ndesc = body->msgh_descriptor_count;
+	}
+	desc_sz = ndesc * (user_hdr ? 12u : 16u);
+	off = hsz + (mach_msg_size_t)sizeof(mach_msg_body_t) + desc_sz;
+	if (off + 8 > msg_size) {
+		return 0;
+	}
+	memcpy(&u64, base + off, 8);
+	ipcz = base + off + 8;
+	avail = msg_size - off - 8;
+	ipcz_size = 0;
+	num_handles = 0;
+	num_bytes = 0;
+	if (avail >= 8) {
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_handles, ipcz + 2, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	if (ipcz_size != 16 && (u64 & 0xffffull) == 16 && avail + 8 >= 8) {
+		ipcz = base + off;
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_handles, ipcz + 2, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	(void)bits;
+	(void)num_handles;
+	return num_bytes;
+}
+
+int
+dtape_ipcz_is_childprocess_pong(const mach_msg_header_t *hdr, int user_hdr)
+{
+	unsigned msgid = 0, seq = 0;
+	uint64_t sub = 0;
+	const unsigned char *base, *ipcz, *imsg;
+	mach_msg_size_t hsz, ndesc, desc_sz, off, msg_size, avail;
+	uint32_t bits, num_bytes, iid, flags;
+	uint64_t u64;
+	uint16_t ipcz_size, num_handles;
+
+	if (!dtape_ipcz_peek(hdr, user_hdr, &msgid, &seq, &sub) ||
+	    msgid != 20) {
+		return 0;
+	}
+	if (hdr == NULL) {
+		return 0;
+	}
+	base = (const unsigned char *)hdr;
+	memcpy(&bits, base, 4);
+	memcpy(&msg_size, base + 4, 4);
+	hsz = user_hdr ? (mach_msg_size_t)sizeof(mach_msg_legacy_header_t) :
+	    (mach_msg_size_t)sizeof(mach_msg_header_t);
+	ndesc = 0;
+	if (msg_size >= hsz + sizeof(mach_msg_body_t)) {
+		const mach_msg_body_t *body = (const mach_msg_body_t *)(base + hsz);
+
+		ndesc = body->msgh_descriptor_count;
+	}
+	desc_sz = ndesc * (user_hdr ? 12u : 16u);
+	off = hsz + (mach_msg_size_t)sizeof(mach_msg_body_t) + desc_sz;
+	if (off + 8 > msg_size) {
+		return 0;
+	}
+	memcpy(&u64, base + off, 8);
+	ipcz = base + off + 8;
+	avail = msg_size - off - 8;
+	ipcz_size = 0;
+	num_handles = 0;
+	num_bytes = 0;
+	if (avail >= 8) {
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_handles, ipcz + 2, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	if (ipcz_size != 16 && (u64 & 0xffffull) == 16 && avail + 8 >= 8) {
+		ipcz = base + off;
+		avail = msg_size - off;
+		memcpy(&ipcz_size, ipcz, 2);
+		memcpy(&num_handles, ipcz + 2, 2);
+		memcpy(&num_bytes, ipcz + 4, 4);
+	}
+	(void)bits;
+	(void)num_handles;
+	(void)seq;
+	(void)sub;
+	if (num_bytes == 0 || num_bytes >= 64 || ipcz_size < 8 ||
+	    avail < (mach_msg_size_t)ipcz_size + 24) {
+		return 0;
+	}
+	imsg = ipcz + ipcz_size;
+	if (!dtape_mojo_from_ipcz(imsg, avail - ipcz_size, &iid, &flags)) {
+		return 0;
+	}
+	/* Mojo reply to flags=1 interface_id=0, not proto/seq=4. */
+	return iid == 0 && (flags & 2u) != 0;
+}
+
+static uint32_t
+dtape_kmsg_cur_pid(void)
+{
+	task_t t = current_task();
+	dtape_task_t *dt;
+
+	if (t == NULL) {
+		return 0;
+	}
+	dt = dtape_task_for_xnu_task(t);
+	return dt ? dt->saved_pid : 0;
+}
+
+static uint32_t
+dtape_kmsg_port_pid(ipc_port_t port, mach_port_name_t *name_out)
+{
+	if (name_out) {
+		*name_out = 0;
+	}
+	if (!IP_VALID(port)) {
+		return 0;
+	}
+	if (name_out) {
+		*name_out = port->ip_receiver_name;
+	}
+	if (port->ip_receiver && port->ip_receiver->is_task) {
+		dtape_task_t *dt = dtape_task_for_xnu_task(port->ip_receiver->is_task);
+
+		return dt ? dt->saved_pid : 0;
+	}
+	return 0;
+}
+
+static uint32_t g_ping_src_pid;
+static uint32_t g_ping_dest_pid;
+static mach_port_name_t g_ping_dest_name;
+static uint32_t g_ping_recv_pid;
+static int g_ping_copyin_seen;
+static int g_ping_copyout_ok;
+static int g_pong_copyin_seen;
+static int g_pong_copyout_attempt;
+static int g_pong_copyout_ok;
+static int g_browser_got_helper_ping;
+static uint32_t g_helper_ping_src_pid;
+static int g_helper_pong_copyin;
+
+static void
+dtape_pong_note_copyin(ipc_kmsg_t kmsg, mach_port_name_t dest_name_before,
+    mach_msg_return_t mr)
+{
+	unsigned msgid = 0, seq = 0;
+	uint64_t sub = 0;
+	uint32_t num_bytes;
+	uint32_t src_pid;
+	uint32_t dest_pid = 0;
+	mach_port_name_t dest_name = dest_name_before;
+	mach_port_name_t local_name = 0;
+	int is_ping;
+	int is_pong;
+	int src_net;
+	int dest_net;
+	int from_browser_after_helper_ping;
+	static int fail_n;
+	static int send_n;
+	static int sl2_n;
+	static int attempt_n;
+
+	if (kmsg == IKM_NULL || kmsg->ikm_header == NULL) {
+		return;
+	}
+	(void)dtape_pong_reply_path_v1;
+	(void)dtape_helper_rx_ping_v1;
+	(void)dtape_browser_pong_after_helper_ping_v1;
+	if (!dtape_ipcz_peek(kmsg->ikm_header, 0, &msgid, &seq, &sub) &&
+	    !dtape_ipcz_peek(kmsg->ikm_header, 1, &msgid, &seq, &sub)) {
+		return;
+	}
+	if (msgid != 20) {
+		return;
+	}
+	num_bytes = dtape_ipcz_num_bytes(kmsg->ikm_header, 0);
+	if (num_bytes == 0) {
+		num_bytes = dtape_ipcz_num_bytes(kmsg->ikm_header, 1);
+	}
+	is_ping = dtape_ipcz_is_mojo_ping(kmsg->ikm_header, 0) ||
+	    dtape_ipcz_is_mojo_ping(kmsg->ikm_header, 1) ||
+	    dtape_ipcz_is_childprocess_ping(kmsg->ikm_header, 0) ||
+	    dtape_ipcz_is_childprocess_ping(kmsg->ikm_header, 1);
+	is_pong = dtape_ipcz_is_childprocess_pong(kmsg->ikm_header, 0) ||
+	    dtape_ipcz_is_childprocess_pong(kmsg->ikm_header, 1);
+	src_pid = dtape_kmsg_cur_pid();
+	src_net = dtape_host_cmdline_is_network(src_pid);
+	if (mr == MACH_MSG_SUCCESS && IP_VALID(kmsg->ikm_header->msgh_remote_port)) {
+		dest_pid = dtape_kmsg_port_pid(kmsg->ikm_header->msgh_remote_port, &dest_name);
+		(void)dtape_kmsg_port_pid(kmsg->ikm_header->msgh_local_port, &local_name);
+	}
+	dest_net = dtape_host_cmdline_is_network(dest_pid);
+	from_browser_after_helper_ping = g_browser_got_helper_ping &&
+	    src_pid == g_ping_recv_pid && !src_net;
+	/*
+	 * Pong is dest=network-helper && num_bytes<64 && Mojo
+	 * flags=IsResponse (2) interface_id=0. Not proto/seq=4
+	 * (that is the Ping AcceptParcel sequence).
+	 */
+	if (dest_net && num_bytes > 0 && num_bytes < 64 && is_pong &&
+	    msgid == 20 && !is_ping) {
+		; /* is_pong already from flags/iid */
+	}
+	if (from_browser_after_helper_ping && sl2_n < 32) {
+		sl2_n++;
+		dtape_log_error(
+		    "browser_pong_after_helper_ping_v1 browser_sl2_send_after_helper_Ping src_pid=%u dest_pid=%u dest_name=0x%x dest_user=0x%x seq=%u sl=%llu num_bytes=%u ping=%d pong=%d dest_net=%d kr=0x%x helper_pid=%u",
+		    src_pid, dest_pid, dest_name, dest_name_before, seq,
+		    (unsigned long long)sub, num_bytes,
+		    is_ping, is_pong, dest_net, mr, g_helper_ping_src_pid);
+	}
+	if (is_pong && dest_net && num_bytes > 0 && num_bytes < 64 &&
+	    msgid == 20 && !is_ping && attempt_n < 32) {
+		attempt_n++;
+		g_pong_copyout_attempt++;
+		dtape_log_error(
+		    "pong_reply_path_v1 Pong copyout_attempt src_pid=%u dest_pid=%u dest_name=0x%x dest_user=0x%x dest_net=%d sl=%llu num_bytes=%u kr=0x%x helper_pid=%u",
+		    src_pid, dest_pid, dest_name, dest_name_before, dest_net,
+		    (unsigned long long)sub, num_bytes, mr, g_helper_ping_src_pid);
+	}
+	if (mr != MACH_MSG_SUCCESS) {
+		if (fail_n < 32 && (is_ping || is_pong || seq == 4 ||
+		    from_browser_after_helper_ping)) {
+			fail_n++;
+			dtape_log_error(
+			    "pong_reply_path_v1 copyin_header_fail src_pid=%u dest_pid=%u dest_name=0x%x dest_user=0x%x msgid=20 seq=%u sl=2 num_bytes=%u ping=%d pong=%d src_net=%d dest_net=%d kr=0x%x",
+			    src_pid, dest_pid, dest_name, dest_name_before, seq, num_bytes,
+			    is_ping, is_pong, src_net, dest_net, mr);
+		}
+		return;
+	}
+	if (is_ping) {
+		const char *kind = "other";
+
+		g_ping_copyin_seen = 1;
+		g_ping_src_pid = src_pid;
+		g_ping_dest_pid = dest_pid;
+		g_ping_dest_name = dest_name;
+		if (src_net) {
+			g_helper_ping_src_pid = src_pid;
+			kind = "network";
+		} else if (dtape_host_cmdline_is_storage(src_pid)) {
+			kind = "storage";
+		}
+		dtape_log_error(
+		    "pong_reply_path_v1 %s Ping copyin src_pid=%u dest_pid=%u dest_name=0x%x local_name=0x%x src_net=%d dest_net=%d num_bytes=%u",
+		    kind, src_pid, dest_pid, dest_name, local_name, src_net, dest_net,
+		    num_bytes);
+		if (dest_net) {
+			dtape_log_error(
+			    "helper_rx_ping_v1 copyin dest_pid=%u dest_name=0x%x src_pid=%u seq=%u waiting helper copyout",
+			    dest_pid, dest_name, src_pid, seq);
+		}
+		return;
+	}
+	if (is_pong && dest_net) {
+		g_pong_copyin_seen = 1;
+		if (dest_pid == g_helper_ping_src_pid || dest_net) {
+			g_helper_pong_copyin = 1;
+		}
+		dtape_log_error(
+		    "pong_reply_path_v1 Pong copyin src_pid=%u dest_pid=%u dest_name=0x%x local_name=0x%x src_net=%d dest_net=%d num_bytes=%u ping_recv_pid=%u helper_pid=%u",
+		    src_pid, dest_pid, dest_name, local_name, src_net, dest_net,
+		    num_bytes, g_ping_recv_pid, g_helper_ping_src_pid);
+		return;
+	}
+	if (g_ping_copyout_ok && src_net && send_n < 16) {
+		send_n++;
+		dtape_log_error(
+		    "pong_reply_path_v1 helper_send_after_ping src_pid=%u dest_pid=%u dest_name=0x%x seq=%u num_bytes=%u ping_recv_pid=%u",
+		    src_pid, dest_pid, dest_name, seq, num_bytes, g_ping_recv_pid);
+	}
+}
+
+static void
+dtape_pong_note_copyout(ipc_kmsg_t kmsg, mach_msg_return_t mr, int attempted)
+{
+	unsigned msgid = 0, seq = 0;
+	uint64_t sub = 0;
+	uint32_t num_bytes;
+	uint32_t recv_pid;
+	mach_port_name_t local_name = 0;
+	mach_port_name_t remote_name = 0;
+	int is_ping;
+	int is_pong;
+	int recv_net;
+
+	if (kmsg == IKM_NULL || kmsg->ikm_header == NULL) {
+		return;
+	}
+	if (!dtape_ipcz_peek(kmsg->ikm_header, 1, &msgid, &seq, &sub) &&
+	    !dtape_ipcz_peek(kmsg->ikm_header, 0, &msgid, &seq, &sub)) {
+		return;
+	}
+	if (msgid != 20) {
+		return;
+	}
+	num_bytes = dtape_ipcz_num_bytes(kmsg->ikm_header, 1);
+	if (num_bytes == 0) {
+		num_bytes = dtape_ipcz_num_bytes(kmsg->ikm_header, 0);
+	}
+	is_ping = dtape_ipcz_is_mojo_ping(kmsg->ikm_header, 1) ||
+	    dtape_ipcz_is_mojo_ping(kmsg->ikm_header, 0) ||
+	    dtape_ipcz_is_childprocess_ping(kmsg->ikm_header, 1) ||
+	    dtape_ipcz_is_childprocess_ping(kmsg->ikm_header, 0);
+	is_pong = dtape_ipcz_is_childprocess_pong(kmsg->ikm_header, 1) ||
+	    dtape_ipcz_is_childprocess_pong(kmsg->ikm_header, 0);
+	recv_pid = dtape_kmsg_cur_pid();
+	recv_net = dtape_host_cmdline_is_network(recv_pid);
+	local_name = CAST_MACH_PORT_TO_NAME(kmsg->ikm_header->msgh_local_port);
+	remote_name = CAST_MACH_PORT_TO_NAME(kmsg->ikm_header->msgh_remote_port);
+	if (is_pong && attempted && recv_net && num_bytes > 0 && num_bytes < 64 &&
+	    seq == 4) {
+		dtape_log_error(
+		    "pong_reply_path_v1 helper Pong copyout_attempt recv_pid=%u local_name=0x%x remote_name=0x%x recv_net=%d num_bytes=%u mr=0x%x",
+		    recv_pid, local_name, remote_name, recv_net, num_bytes, mr);
+	}
+	if (is_pong && mr == MACH_MSG_SUCCESS && recv_net &&
+	    num_bytes > 0 && num_bytes < 64 && seq == 4) {
+		g_pong_copyout_ok = 1;
+		dtape_log_error(
+		    "pong_reply_path_v1 Pong copyout_ok recv_pid=%u local_name=0x%x remote_name=0x%x recv_net=%d num_bytes=%u",
+		    recv_pid, local_name, remote_name, recv_net, num_bytes);
+		dtape_log_error(
+		    "pong_reply_path_v1 helper_received_Pong pid=%u port=0x%x src_pid=%u",
+		    recv_pid, local_name, g_ping_recv_pid);
+	}
+	if (is_pong && mr != MACH_MSG_SUCCESS && recv_net &&
+	    num_bytes > 0 && num_bytes < 64 && seq == 4) {
+		dtape_log_error(
+		    "pong_reply_path_v1 Pong copyout_fail recv_pid=%u local_name=0x%x remote_name=0x%x recv_net=%d num_bytes=%u mr=0x%x",
+		    recv_pid, local_name, remote_name, recv_net, num_bytes, mr);
+	}
+	if (!is_ping) {
+		return;
+	}
+	if (mr != MACH_MSG_SUCCESS) {
+		dtape_log_error(
+		    "pong_reply_path_v1 Ping copyout_fail recv_pid=%u local_name=0x%x remote_name=0x%x recv_net=%d num_bytes=%u mr=0x%x",
+		    recv_pid, local_name, remote_name, recv_net, num_bytes, mr);
+		return;
+	}
+	g_ping_copyout_ok = 1;
+	g_ping_recv_pid = recv_pid;
+	{
+		const char *kind = "other";
+		const unsigned char *base = (const unsigned char *)kmsg->ikm_header;
+		char hex[33];
+		static const char hx[] = "0123456789abcdef";
+		unsigned i;
+		mach_msg_size_t n = 16;
+
+		if (dtape_host_cmdline_is_network(g_ping_src_pid)) {
+			kind = "network";
+		} else if (dtape_host_cmdline_is_storage(g_ping_src_pid)) {
+			kind = "storage";
+		}
+		if (kmsg->ikm_header->msgh_size < n) {
+			n = kmsg->ikm_header->msgh_size;
+		}
+		for (i = 0; i < n; i++) {
+			hex[i * 2] = hx[base[i] >> 4];
+			hex[i * 2 + 1] = hx[base[i] & 0xf];
+		}
+		hex[n * 2] = 0;
+		dtape_log_error(
+		    "pong_reply_path_v1 %s Ping copyout_ok recv_pid=%u local_name=0x%x remote_name=0x%x recv_net=%d src_pid=%u dest_pid=%u dest_name=0x%x num_bytes=%u sl=%llu proto=%u hex=%s",
+		    kind, recv_pid, local_name, remote_name, recv_net, g_ping_src_pid, g_ping_dest_pid,
+		    g_ping_dest_name, num_bytes, (unsigned long long)sub, seq, hex);
+		dtape_nodelink_invite_dump("ping_copyout_ok", recv_pid);
+		if (recv_net || dtape_host_cmdline_is_storage(recv_pid)) {
+			dtape_helper_fifo_peek(kmsg, sub, g_ping_dest_name);
+		}
+	}
+	if (recv_net || dtape_host_cmdline_is_storage(recv_pid)) {
+		dtape_log_error(
+		    "pong_reply_path_v1 helper_received_Ping pid=%u port=0x%x sl=%llu seq=%u nb=%u waiting Pong copyout from helper net=%d stor=%d",
+		    recv_pid, local_name, (unsigned long long)sub, seq,
+		    num_bytes, recv_net,
+		    dtape_host_cmdline_is_storage(recv_pid));
+		dtape_rls_accept_peek(sub, seq);
+	} else if (dtape_host_cmdline_is_network(g_ping_src_pid) ||
+	    dtape_host_cmdline_is_storage(g_ping_src_pid)) {
+		g_browser_got_helper_ping = 1;
+		if (g_helper_ping_src_pid == 0) {
+			g_helper_ping_src_pid = g_ping_src_pid;
+		}
+		dtape_log_error(
+		    "browser_pong_after_helper_ping_v1 browser_got_helper_Ping recv_pid=%u port=0x%x src_pid=%u dest_name=0x%x waiting IOThread Pong copyout to helper dest_pid=%u",
+		    recv_pid, local_name, g_ping_src_pid, g_ping_dest_name,
+		    g_helper_ping_src_pid);
+	} else {
+		dtape_log_error(
+		    "pong_reply_path_v1 helper_did_not_receive_Ping recv_pid=%u src_pid=%u dest_pid=%u dest_name=0x%x local_name=0x%x reply cannot start in helper",
+		    recv_pid, g_ping_src_pid, g_ping_dest_pid, g_ping_dest_name, local_name);
+	}
+}
+
+static void
+dtape_pong_note_send_error(ipc_kmsg_t kmsg, ipc_port_t port, mach_msg_return_t error)
+{
+	unsigned msgid = 0, seq = 0;
+	uint64_t sub = 0;
+	uint32_t dest_pid = 0;
+	mach_port_name_t dest_name = 0;
+	int is_pong;
+	int is_ping;
+
+	if (error == MACH_MSG_SUCCESS || kmsg == IKM_NULL || kmsg->ikm_header == NULL) {
+		return;
+	}
+	if (!dtape_ipcz_peek(kmsg->ikm_header, 0, &msgid, &seq, &sub)) {
+		return;
+	}
+	if (msgid != 20 || sub != 2 || seq != 4) {
+		return;
+	}
+	is_ping = dtape_ipcz_is_childprocess_ping(kmsg->ikm_header, 0);
+	is_pong = dtape_ipcz_is_childprocess_pong(kmsg->ikm_header, 0);
+	dest_pid = dtape_kmsg_port_pid(port, &dest_name);
+	dtape_log_error(
+	    "pong_reply_path_v1 send_fail src_pid=%u dest_pid=%u dest_name=0x%x ping=%d pong=%d kr=0x%x",
+	    dtape_kmsg_cur_pid(), dest_pid, dest_name, is_ping, is_pong, error);
+}
+
+__attribute__((used)) static const char dtape_accept20_router_v1[] = "accept20_router_v1";
+__attribute__((used)) static const char dtape_rendezvous_mojo_norebind_v1[] = "rendezvous_mojo_norebind_v1";
+__attribute__((used)) static const char dtape_samechan_bind_seq4_v1[] =
+	"samechan_bind_seq4_v1";
+__attribute__((used)) static const char dtape_handle_order_v1[] =
+	"handle_order_v1";
+__attribute__((used)) static const char dtape_desc12_copyout_v1[] =
+	"desc12_copyout_v1";
+__attribute__((used)) static const char dtape_nodelink_connect_v1[] =
+	"nodelink_connect_v1";
+__attribute__((used)) static const char dtape_nodelink_connect_body_v1[] =
+	"nodelink_connect_body_v1";
+__attribute__((used)) static const char dtape_ping_copyin_mark_v1[] =
+	"Ping copyin msgid=20 proto=4 sl=2";
+
+static void dtape_desc12_live_dump(const char *dir, ipc_kmsg_t kmsg,
+    ipc_space_t space, int user_hdr);
+__attribute__((used)) static const char dtape_pong_copyin_mark_v1[] =
+	"Pong copyin msgid=20 proto=4 sl=2";
+__attribute__((used)) static const char dtape_real_ping_v1[] =
+	"real_ping_v1";
+__attribute__((used)) static const char dtape_sl1424_name_v1[] =
+	"helper_sl1424_name_v1";
+
+/*
+ * Mojo MessageHeader after ipcz AcceptParcel parcel_data ArrayHeader.
+ * kFlagExpectsResponse=1, kFlagIsResponse=2. Channel IpczHeader is
+ * {u16 size, u16 num_handles, u32 num_bytes, i64 v2_ticks} — num_bytes
+ * is at +4. Bytes 8–15 are creation_timeticks_us (UMA only).
+ */
+static int
+dtape_mojo_hdr_from_ipcz(const unsigned char *imsg, mach_msg_size_t avail,
+    uint32_t *iid, uint32_t *name, uint32_t *flags)
+{
+	uint32_t dh_nb, dh_ver;
+	mach_msg_size_t o;
+
+	if (iid != NULL) {
+		*iid = 0xffffffffu;
+	}
+	if (name != NULL) {
+		*name = 0xffffffffu;
+	}
+	if (flags != NULL) {
+		*flags = 0xffffffffu;
+	}
+	if (imsg == NULL) {
+		return 0;
+	}
+	if (avail >= 104) {
+		memcpy(&dh_nb, imsg + 80, 4);
+		memcpy(&dh_ver, imsg + 84, 4);
+		if (dh_ver == 3 && dh_nb >= 24 && dh_nb <= 256) {
+			if (iid != NULL) {
+				memcpy(iid, imsg + 88, 4);
+			}
+			if (name != NULL) {
+				memcpy(name, imsg + 92, 4);
+			}
+			if (flags != NULL) {
+				memcpy(flags, imsg + 96, 4);
+			}
+			return 1;
+		}
+	}
+	for (o = 24; o + 24 <= avail; o += 8) {
+		memcpy(&dh_nb, imsg + o, 4);
+		memcpy(&dh_ver, imsg + o + 4, 4);
+		if (dh_ver == 3 && dh_nb >= 24 && dh_nb <= 256) {
+			if (iid != NULL) {
+				memcpy(iid, imsg + o + 8, 4);
+			}
+			if (name != NULL) {
+				memcpy(name, imsg + o + 12, 4);
+			}
+			if (flags != NULL) {
+				memcpy(flags, imsg + o + 16, 4);
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int
+dtape_mojo_from_ipcz(const unsigned char *imsg, mach_msg_size_t avail,
+    uint32_t *iid, uint32_t *flags)
+{
+	return dtape_mojo_hdr_from_ipcz(imsg, avail, iid, NULL, flags);
+}
+
+static uint16_t
+dtape_ch_type_from_bytes(const unsigned char *p, mach_msg_size_t avail,
+    uint16_t *hdrb_out, uint32_t *nb_out)
+{
+	uint32_t nb;
+	uint16_t hdrb;
+	uint16_t typ;
+	uint16_t ipcz_size;
+
+	if (hdrb_out != NULL) {
+		*hdrb_out = 0xffff;
+	}
+	if (nb_out != NULL) {
+		*nb_out = 0;
+	}
+	if (p == NULL || avail < 8) {
+		return 0xffff;
+	}
+	memcpy(&ipcz_size, p, 2);
+	if (ipcz_size == 16 || ipcz_size == 24) {
+		return 0xffff;
+	}
+	memcpy(&nb, p, 4);
+	memcpy(&hdrb, p + 4, 2);
+	memcpy(&typ, p + 6, 2);
+	if (nb >= 8 && nb <= 4096 &&
+	    (hdrb == 8 || hdrb == 16 || hdrb == 24 || hdrb == 32) &&
+	    typ <= 6) {
+		if (hdrb_out != NULL) {
+			*hdrb_out = hdrb;
+		}
+		if (nb_out != NULL) {
+			*nb_out = nb;
+		}
+		return typ;
+	}
+	return 0xffff;
+}
+
+/*
+ * Channel Mac payload: mach_msg_body_t, then ndesc * (12 user / 16 kernel)
+ * port descriptors, then uint64 length + IpczHeader. Dump both ends so
+ * GPU (Bind succeeds) and network (EnsureConnected) parcels can be compared.
+ */
+static void
+dtape_channel_ipcz_dump(const char *dir, mach_msg_header_t *hdr, int user_hdr, int user_desc)
+{
+	static int dumps;
+	const unsigned char *base, *ipcz, *msg;
+	mach_msg_size_t hsz, ndesc, desc_sz, off, nhex, i, msg_size, avail;
+	uint32_t bits, id, num_bytes, proto, nportals, struct_sz;
+	uint32_t mojo_iid, mojo_flags, mojo_name;
+	uint64_t u64, sublink, v2_ticks;
+	uint16_t ipcz_size, num_handles;
+	unsigned char msgid;
+	char hex[1025];
+	static const char hx[] = "0123456789abcdef";
+	static uint32_t samechan_n;
+
+	if (hdr == NULL) {
+		return;
+	}
+	base = (const unsigned char *)hdr;
+	memcpy(&bits, base, 4);
+	memcpy(&msg_size, base + 4, 4);
+	if (user_hdr) {
+		memcpy(&id, base + 20, 4);
+	} else {
+		memcpy(&id, base + 28, 4);
+	}
+	if (id != 0x4d4f4a4f && id != 0x4d4f4a2b) {
+		return;
+	}
+	if (dumps > 4000) {
+		return;
+	}
+	dumps++;
+
+	hsz = user_hdr ? (mach_msg_size_t)sizeof(mach_msg_legacy_header_t) :
+	    (mach_msg_size_t)sizeof(mach_msg_header_t);
+	ndesc = 0;
+	if (msg_size >= hsz + sizeof(mach_msg_body_t)) {
+		const mach_msg_body_t *body = (const mach_msg_body_t *)(base + hsz);
+
+		ndesc = body->msgh_descriptor_count;
+	}
+	desc_sz = ndesc * (user_desc ? 12u : 16u);
+	off = hsz + (mach_msg_size_t)sizeof(mach_msg_body_t) + desc_sz;
+	u64 = 0;
+	ipcz = NULL;
+	ipcz_size = 0;
+	num_handles = 0;
+	num_bytes = 0;
+	msgid = 0xff;
+	proto = 0xffffffffu;
+	nportals = 0xffffffffu;
+	sublink = ~(uint64_t)0;
+	mojo_iid = 0xffffffffu;
+	mojo_flags = 0xffffffffu;
+	mojo_name = 0xffffffffu;
+	v2_ticks = 0;
+	(void)dtape_samechan_bind_seq4_v1;
+	(void)dtape_handle_order_v1;
+	(void)dtape_ping_copyin_mark_v1;
+	(void)dtape_pong_copyin_mark_v1;
+	(void)dtape_nodelink_connect_v1;
+	(void)dtape_nodelink_connect_body_v1;
+	if (off + 8 <= msg_size) {
+		memcpy(&u64, base + off, 8);
+		ipcz = base + off + 8;
+		avail = msg_size - off - 8;
+		if (avail >= 8) {
+			memcpy(&ipcz_size, ipcz, 2);
+			memcpy(&num_handles, ipcz + 2, 2);
+			memcpy(&num_bytes, ipcz + 4, 4);
+		}
+		if (avail >= 16) {
+			memcpy(&v2_ticks, ipcz + 8, 8);
+		}
+		/*
+		 * Channel Mac always writes uint64 length then IpczHeader.
+		 * If the uint64 slot looks like an IpczHeader (size=16), the
+		 * length word was omitted; parse from `off` instead.
+		 */
+		if (ipcz_size != 16 && (u64 & 0xffffull) == 16) {
+			ipcz = base + off;
+			avail = msg_size - off;
+			memcpy(&ipcz_size, ipcz, 2);
+			memcpy(&num_handles, ipcz + 2, 2);
+			memcpy(&num_bytes, ipcz + 4, 4);
+			if (avail >= 16) {
+				memcpy(&v2_ticks, ipcz + 8, 8);
+			}
+		}
+		if (ipcz != NULL && ipcz_size >= 8 && avail >= (mach_msg_size_t)ipcz_size + 24) {
+			msg = ipcz + ipcz_size;
+			msgid = msg[2];
+			if ((msgid == 0 || msgid == 1) && avail >= (mach_msg_size_t)ipcz_size + 40) {
+				uint32_t dest_pid = 0;
+				mach_port_name_t dest_name = 0;
+				uint32_t ninit = 0xffffffffu;
+				uint32_t cver = 0xffffffffu;
+				uint8_t hdr_sz = msg[0];
+				char bname[33];
+				char rname[33];
+				char mhex[161];
+				unsigned hi;
+				unsigned long long nsize = 0;
+				unsigned nprot = 0;
+				int is_copy = -1;
+				unsigned kotype = 0;
+
+				memcpy(&struct_sz, msg + 24, 4);
+				memcpy(&proto, msg + 32, 4);
+				memcpy(&nportals, msg + 36, 4);
+				memset(bname, 0, sizeof(bname));
+				memset(rname, 0, sizeof(rname));
+				memset(mhex, 0, sizeof(mhex));
+				if (!user_hdr) {
+					dest_pid = dtape_kmsg_port_pid(
+					    hdr->msgh_remote_port, &dest_name);
+				} else {
+					dest_name = (mach_port_name_t)hdr->msgh_remote_port;
+				}
+				if (msgid == 0 &&
+				    avail >= (mach_msg_size_t)ipcz_size + 72) {
+					memcpy(&cver, msg + 64, 4);
+					memcpy(&ninit, msg + 68, 4);
+					for (hi = 0; hi < 16; hi++) {
+						unsigned char b = msg[32 + hi];
+						unsigned char r = msg[48 + hi];
+
+						bname[hi * 2] = hx[b >> 4];
+						bname[hi * 2 + 1] = hx[b & 0xf];
+						rname[hi * 2] = hx[r >> 4];
+						rname[hi * 2 + 1] = hx[r & 0xf];
+					}
+				} else if (msgid == 1) {
+					cver = proto;
+					ninit = nportals;
+				}
+				for (hi = 0; hi < 80 &&
+				    (mach_msg_size_t)ipcz_size + hi < avail; hi++) {
+					unsigned char b = msg[hi];
+
+					mhex[hi * 2] = hx[b >> 4];
+					mhex[hi * 2 + 1] = hx[b & 0xf];
+				}
+				if (!user_hdr && !user_desc && ndesc > 0) {
+					const mach_msg_port_descriptor_t *pd;
+					ipc_port_t p;
+
+					pd = (const mach_msg_port_descriptor_t *)(base + hsz +
+					    sizeof(mach_msg_body_t));
+					p = pd->name;
+					if (IP_VALID(p)) {
+						kotype = ip_kotype(p);
+						if (kotype == IKOT_NAMED_ENTRY) {
+							vm_named_entry_t ne;
+
+							ne = (vm_named_entry_t)ip_get_kobject(p);
+							if (ne) {
+								nsize = (unsigned long long)ne->size;
+								nprot = (unsigned)ne->protection;
+								is_copy = ne->is_copy;
+							}
+						}
+					}
+				}
+				dtape_log_error(
+				    "nodelink_connect_v1 dir=%s dest_pid=%u dest_name=0x%x msgid=%u ninit=%u cver=%u hdr_sz=%u struct_sz=%u num_handles=%u ndesc=%u net_dest=%d kotype=%u nsize=%llu nprot=0x%x is_copy=%d",
+				    dir, dest_pid, dest_name, msgid, ninit, cver,
+				    hdr_sz, struct_sz, num_handles, ndesc,
+				    dtape_host_cmdline_is_network(dest_pid),
+				    kotype, nsize, nprot, is_copy);
+				dtape_log_error(
+				    "nodelink_connect_body_v1 dir=%s msgid=%u ninit=%u broker=%s recv=%s body=%s",
+				    dir, msgid, ninit, bname, rname, mhex);
+				dtape_nodelink_invite_dump(
+				    msgid == 0 ? "connect0" : "connect1",
+				    dest_pid);
+			}
+			if (msgid == 22 && avail >= (mach_msg_size_t)ipcz_size + 40) {
+				memcpy(&sublink, msg + 32, 8);
+			}
+			if (msgid == 20 && avail >= (mach_msg_size_t)ipcz_size + 48) {
+				memcpy(&sublink, msg + 32, 8);
+				memcpy(&proto, msg + 40, 4);
+				(void)dtape_mojo_hdr_from_ipcz(msg,
+				    avail - ipcz_size, &mojo_iid, &mojo_name,
+				    &mojo_flags);
+			}
+			if (msgid == 34 && avail >= (mach_msg_size_t)ipcz_size + 72) {
+				uint64_t new_sl = 0, buf_id = 0, inbound_n = 0;
+				uint32_t frag_off = 0, frag_sz = 0;
+
+				memcpy(&sublink, msg + 32, 8);
+				memcpy(&new_sl, msg + 40, 8);
+				memcpy(&buf_id, msg + 48, 8);
+				memcpy(&frag_off, msg + 56, 4);
+				memcpy(&frag_sz, msg + 60, 4);
+				memcpy(&inbound_n, msg + 64, 8);
+				dtape_log_error("bypass34_n_v1 dir=%s sl=%llu new_sl=%llu buf=%llu off=0x%x sz=0x%x inbound_n=%llu",
+				    dir, (unsigned long long)sublink,
+				    (unsigned long long)new_sl,
+				    (unsigned long long)buf_id, frag_off, frag_sz,
+				    (unsigned long long)inbound_n);
+				dtape_log_error(
+				    "helper_34_vs_ping_v1 dir=%s cur=%u sl=%llu new_sl=%llu ping_copyout_ok=%d stor=%d net=%d",
+				    dir, dtape_kmsg_cur_pid(),
+				    (unsigned long long)sublink,
+				    (unsigned long long)new_sl, g_ping_copyout_ok,
+				    dtape_host_cmdline_is_storage(dtape_kmsg_cur_pid()),
+				    dtape_host_cmdline_is_network(dtape_kmsg_cur_pid()));
+				{
+					uint32_t dump_dest = 0;
+
+					if (!user_hdr) {
+						dump_dest = dtape_kmsg_port_pid(
+						    hdr->msgh_remote_port, NULL);
+					}
+					dtape_nodelink_invite_dump(
+					    (dir != NULL &&
+					    strncmp(dir, "copyin", 6) == 0) ?
+					    "helper34" : "peer34", dump_dest);
+				}
+				if (frag_off != 0) {
+					dtape_rls_frag_copyout_note(frag_off);
+				}
+				if (strncmp(dir, "copyin", 6) == 0) {
+					dtape_inbound_flush_before_34();
+				}
+				dtape_rls_fe_observe(dir, 34, frag_off);
+			}
+			if (msgid == 35 && avail >= (mach_msg_size_t)ipcz_size + 48) {
+				uint64_t outbound_n = 0;
+
+				memcpy(&sublink, msg + 32, 8);
+				memcpy(&outbound_n, msg + 40, 8);
+				dtape_log_error("bypass35_n_v1 dir=%s sl=%llu outbound_n=%llu",
+				    dir, (unsigned long long)sublink,
+				    (unsigned long long)outbound_n);
+				dtape_rls_fe_observe(dir, 35, 0);
+			}
+			if (msgid == 36) {
+				dtape_log_error("bypass36_n_v1 dir=%s sl=%llu FlushRouter",
+				    dir, (unsigned long long)sublink);
+				dtape_rls_fe_observe(dir, 36, 0);
+			}
+			if (msgid == 20 && avail >= (mach_msg_size_t)ipcz_size + 84) {
+				uint32_t h_off = 0;
+				uint32_t r_off = 0;
+				uint32_t hn = 0;
+				uint32_t rn = 0;
+				uint32_t ri;
+				uint32_t rbytes = 0;
+
+				memcpy(&h_off, msg + 76, 4);
+				memcpy(&r_off, msg + 80, 4);
+				if (h_off != 0 && h_off + 8 <= num_bytes) {
+					memcpy(&hn, msg + h_off + 4, 4);
+				}
+				if (r_off != 0 && r_off + 8 <= num_bytes) {
+					memcpy(&rbytes, msg + r_off, 4);
+					memcpy(&rn, msg + r_off + 4, 4);
+				}
+				dtape_log_error("accept20_router_v1 dir=%s sublink=%llu seq=%u nhandles=%u nrouters=%u r_off=%u",
+				    dir, (unsigned long long)sublink, proto, hn, rn, r_off);
+				for (ri = 0; ri < rn && ri < 4; ri++) {
+					uint64_t nsl = 0;
+					uint64_t dec = 0;
+					uint64_t bufid = ~(uint64_t)0;
+					uint32_t foff = 0;
+					uint32_t fsz = 0;
+					unsigned char flags = 0;
+					mach_msg_size_t ro = (mach_msg_size_t)r_off + 8 + ri * 96;
+
+					if (ro + 72 > num_bytes) {
+						break;
+					}
+					memcpy(&nsl, msg + ro + 8, 8);
+					memcpy(&bufid, msg + ro + 16, 8);
+					memcpy(&foff, msg + ro + 24, 4);
+					memcpy(&fsz, msg + ro + 28, 4);
+					memcpy(&dec, msg + ro + 32, 8);
+					memcpy(&flags, msg + ro + 64, 1);
+					dtape_log_error("accept20_router_v1 dir=%s i=%u new_sublink=%llu decaying=%llu frag_buf=%llu frag_off=0x%x frag_sz=0x%x flags=0x%x",
+					    dir, ri, (unsigned long long)nsl, (unsigned long long)dec,
+					    (unsigned long long)bufid, foff, fsz, flags);
+					if (foff != 0) {
+						dtape_rls_frag_copyout_note(foff);
+					}
+				}
+				if (strcmp(dir, "copyout") == 0 && sublink == 2) {
+					dtape_rls_accept_peek(sublink, proto);
+					dtape_rls_fe_observe(dir, 20, 0);
+				}
+			}
+		}
+		nhex = avail;
+		if (nhex > 512) {
+			nhex = 512;
+		}
+		for (i = 0; i < nhex; i++) {
+			hex[i * 2] = hx[ipcz[i] >> 4];
+			hex[i * 2 + 1] = hx[ipcz[i] & 0xf];
+		}
+		hex[nhex * 2] = 0;
+		dtape_log_error("channel_ipcz_dump_v3 dir=%s bits=0x%x msgh_size=%u hsz=%u ndesc=%u off=%u u64len=%llu ipcz_size=%u num_handles=%u num_bytes=%u msgid=%u proto=%u nportals=%u sublink=%llu hex=%s",
+		    dir, bits, msg_size, hsz, ndesc, off,
+		    (unsigned long long)u64, ipcz_size, num_handles, num_bytes,
+		    msgid, proto, nportals, (unsigned long long)sublink, hex);
+		if (samechan_n < 256 && (msgid == 22 || msgid == 20 || msgid == 34)) {
+			uint32_t dest_pid = 0;
+			mach_port_name_t dest_name = 0;
+			mach_port_name_t local_name = 0;
+
+			samechan_n++;
+			if (!user_hdr) {
+				dest_pid = dtape_kmsg_port_pid(
+				    hdr->msgh_remote_port, &dest_name);
+				(void)dtape_kmsg_port_pid(
+				    hdr->msgh_local_port, &local_name);
+			} else {
+				dest_name = (mach_port_name_t)hdr->msgh_remote_port;
+				local_name = (mach_port_name_t)hdr->msgh_local_port;
+			}
+			dtape_log_error(
+			    "samechan_bind_seq4_v1 dir=%s dest_pid=%u dest_name=0x%x local_name=0x%x msgid=%u sl=%llu seq=%u nb=%u iid=%u name=%u flags=%u v2=%llu parse_nb_off=4 hdr16=%u net_dest=%d",
+			    dir, dest_pid, dest_name, local_name, msgid,
+			    (unsigned long long)sublink, proto, num_bytes,
+			    mojo_iid, mojo_name, mojo_flags,
+			    (unsigned long long)v2_ticks, ipcz_size,
+			    dtape_host_cmdline_is_network(dest_pid));
+			if (msgid == 20 &&
+			    (sublink == 14 || sublink == 34 ||
+			    sublink == 24 || sublink == 15) &&
+			    (mojo_flags & 1u) != 0) {
+				int name0 = (mojo_iid == 0 && mojo_name == 0);
+
+				(void)dtape_sl1424_name_v1;
+				dtape_log_error(
+				    "helper_sl1424_name_v1 dir=%s dest_pid=%u sl=%llu seq=%u nb=%u iid=%u name=%u flags=%u name0=%d net_dest=%d user_hdr=%d",
+				    dir, dest_pid,
+				    (unsigned long long)sublink, proto,
+				    num_bytes, mojo_iid, mojo_name,
+				    mojo_flags, name0,
+				    dtape_host_cmdline_is_network(dest_pid),
+				    user_hdr);
+			}
+		}
+		if (msgid == 20 && sublink == 2 && proto <= 7) {
+			uint32_t dest_pid = 0;
+			mach_port_name_t dest_name = 0;
+
+			if (!user_hdr) {
+				dest_pid = dtape_kmsg_port_pid(
+				    hdr->msgh_remote_port, &dest_name);
+			} else {
+				dest_name = (mach_port_name_t)hdr->msgh_remote_port;
+			}
+			dtape_log_error(
+			    "handle_order_v1 dir=%s dest_pid=%u dest_name=0x%x sl=2 seq=%u nb=%u iid=%u flags=%u net_dest=%d user_hdr=%d",
+			    dir, dest_pid, dest_name, proto, num_bytes,
+			    mojo_iid, mojo_flags,
+			    dtape_host_cmdline_is_network(dest_pid), user_hdr);
+			if (proto == 4) {
+				dtape_nodelink_invite_dump(
+				    (dir != NULL && strcmp(dir, "copyout") == 0) ?
+				    "seq4_copyout" : "seq4_copyin", dest_pid);
+			}
+		}
+		if (dir != NULL && strcmp(dir, "copyout") == 0 && msgid == 20) {
+			dtape_gpu_hs20_note_copyout();
+		}
+		if (msgid == 20 && dir != NULL && strncmp(dir, "copyin", 6) == 0) {
+			if (num_bytes == 184 && mojo_iid == 0 &&
+			    (mojo_flags & 1u) != 0) {
+				uint32_t dest_pid = 0;
+
+				if (!user_hdr) {
+					dest_pid = dtape_kmsg_port_pid(
+					    hdr->msgh_remote_port, NULL);
+				}
+				dtape_log_error("Ping copyin msgid=20 proto=4 sl=%llu num_bytes=%u seq=%u iid=0 flags=%u dest_pid=%u net_dest=%d",
+				    (unsigned long long)sublink, num_bytes, proto, mojo_flags,
+				    dest_pid, dtape_host_cmdline_is_network(dest_pid));
+				dtape_nodelink_invite_dump("ping_copyin",
+				    dest_pid);
+			} else if (num_bytes > 0 && num_bytes < 64 &&
+			    mojo_iid == 0 && (mojo_flags & 2u) != 0) {
+				uint32_t dest_pid = 0;
+
+				if (!user_hdr) {
+					dest_pid = dtape_kmsg_port_pid(
+					    hdr->msgh_remote_port, NULL);
+				}
+				dtape_log_error("Pong copyin msgid=20 proto=4 sl=%llu num_bytes=%u dest_pid=%u iid=0 flags=%u seq=%u net_dest=%d",
+				    (unsigned long long)sublink, num_bytes, dest_pid,
+				    mojo_flags, proto,
+				    dtape_host_cmdline_is_network(dest_pid));
+			}
+		}
+		{
+			uint16_t cht = 0xffff;
+			uint16_t hdrb = 0xffff;
+			uint32_t ch_nb = 0;
+			uint32_t dest_pid = 0;
+			int interesting;
+			static int real_n;
+
+			(void)dtape_real_ping_v1;
+			cht = dtape_ch_type_from_bytes(ipcz, avail, &hdrb,
+			    &ch_nb);
+			if (cht == 0xffff && off + 8 <= msg_size) {
+				cht = dtape_ch_type_from_bytes(base + off,
+				    msg_size - off, &hdrb, &ch_nb);
+			}
+			interesting = (cht == 2 || cht == 3) ||
+			    (msgid == 20 && sublink == 15 &&
+			    (mojo_flags & 1u) != 0) ||
+			    (msgid == 20 && mojo_iid == 0 && mojo_name == 0 &&
+			    (mojo_flags & 1u) != 0);
+			if (interesting && real_n < 80) {
+				real_n++;
+				if (!user_hdr) {
+					dest_pid = dtape_kmsg_port_pid(
+					    hdr->msgh_remote_port, NULL);
+				}
+				dtape_log_error(
+				    "real_ping_v1 dir=%s dest_pid=%u msgid=%u sl=%llu seq=%u nb=%u iid=%u name=%u flags=%u ch_type=%u ch_hdrb=%u ch_nb=%u net_dest=%d",
+				    dir, dest_pid, msgid,
+				    (unsigned long long)sublink, proto,
+				    num_bytes, mojo_iid, mojo_name, mojo_flags,
+				    cht, hdrb, ch_nb,
+				    dtape_host_cmdline_is_network(dest_pid));
+			}
+		}
+	} else {
+		dtape_log_error("channel_ipcz_dump_v3 dir=%s bits=0x%x msgh_size=%u hsz=%u ndesc=%u off=%u TOO_SMALL",
+		    dir, bits, msg_size, hsz, ndesc, off);
+	}
+}
+#endif
+
 /*
  *	Routine:	ipc_kmsg_put
  *	Purpose:
@@ -2456,7 +3865,11 @@ ipc_kmsg_put(
 	    kmsg->ikm_header->msgh_id);
 
 #if defined(__LP64__)
+#ifdef __DARLING__
+	if (dtape_copyout_legacy_header()) {
+#else
 	if (current_task() != kernel_task) { /* don't if receiver expects fully-cooked in-kernel msg; */
+#endif
 		mach_msg_legacy_header_t *legacy_header =
 		    (mach_msg_legacy_header_t *)((vm_offset_t)(kmsg->ikm_header) + LEGACY_HEADER_SIZE_DELTA);
 
@@ -2476,7 +3889,36 @@ ipc_kmsg_put(
 
 		size -= LEGACY_HEADER_SIZE_DELTA;
 		kmsg->ikm_header = (mach_msg_header_t *)legacy_header;
+#ifdef __DARLING__
+		if (id == 0x6d6a6873 || id == 0x4d4f4a4f || id == 0x4d4f4a2b) {
+			mach_msg_max_trailer_t *tr = (mach_msg_max_trailer_t *)
+			    ((vm_offset_t)legacy_header +
+			    mach_round_msg(legacy_header->msgh_size));
+
+			dtape_log_error("channel_put_legacy_v1 id=0x%x user_size=%u trailer=%u audit_pid=%u opt=0x%x",
+			    id, legacy_header->msgh_size, trailer_size,
+			    tr->msgh_audit.val[5], option);
+			dtape_channel_ipcz_dump("copyout",
+			    (mach_msg_header_t *)legacy_header, 1, 1);
+			dtape_desc12_live_dump("copyout_put", kmsg,
+			    current_space(), 1);
+			if (dtape_ipcz_is_childprocess_ping(
+			    (mach_msg_header_t *)legacy_header, 1) ||
+			    dtape_ipcz_is_childprocess_ping(
+			    (mach_msg_header_t *)legacy_header, 0)) {
+				dtape_bypass34_note_seq4_copyout(kmsg);
+			}
+		}
+#endif
 	}
+#ifdef __DARLING__
+	else if (kmsg->ikm_header->msgh_id == 0x6d6a6873 ||
+	    kmsg->ikm_header->msgh_id == 0x4d4f4a4f) {
+		dtape_log_error("channel_put_nolegacy_v1 id=0x%x size=%u map=%p task=%p",
+		    kmsg->ikm_header->msgh_id, kmsg->ikm_header->msgh_size,
+		    current_map(), current_task());
+	}
+#endif
 #endif
 
 	/* unreachable if !DEBUG */
@@ -2497,10 +3939,29 @@ ipc_kmsg_put(
 	}
 
 	if (copyoutmsg((const char *) kmsg->ikm_header, rcv_addr, size)) {
+#ifdef __DARLING__
+		dtape_log_error("copyoutmsg_fail_v1 id=0x%x rcv=0x%llx nbytes=%u",
+		    kmsg->ikm_header ? kmsg->ikm_header->msgh_id : 0,
+		    (unsigned long long)rcv_addr, size);
+		dtape_pong_note_copyout(kmsg, MACH_RCV_INVALID_DATA, 1);
+#endif
 		mr = MACH_RCV_INVALID_DATA;
 		size = 0;
 	} else {
 		mr = MACH_MSG_SUCCESS;
+#ifdef __DARLING__
+		if (kmsg->ikm_header &&
+		    (kmsg->ikm_header->msgh_id == 0x4d4f4a4f ||
+		    kmsg->ikm_header->msgh_id == 0x4d4f4a2b) &&
+		    (dtape_ipcz_is_childprocess_ping(kmsg->ikm_header, 1) ||
+		    dtape_ipcz_is_childprocess_ping(kmsg->ikm_header, 0))) {
+			dtape_log_error("ping_copyoutmsg_ok_v1 rcv=0x%llx nbytes=%u local=%p remote=%p",
+			    (unsigned long long)rcv_addr, size,
+			    (void *)kmsg->ikm_header->msgh_local_port,
+			    (void *)kmsg->ikm_header->msgh_remote_port);
+		}
+		dtape_pong_note_copyout(kmsg, MACH_MSG_SUCCESS, 1);
+#endif
 	}
 
 	KERNEL_DEBUG_CONSTANT(MACHDBG_CODE(DBG_MACH_IPC, MACH_IPC_KMSG_LINK) | DBG_FUNC_NONE,
@@ -3343,12 +4804,12 @@ ipc_kmsg_copyin_port_descriptor(
 	mach_msg_type_name_t        user_disp;
 	mach_msg_type_name_t        result_disp;
 	mach_port_name_t            name;
-	ipc_object_t                        object;
+	ipc_object_t                        object = IO_NULL;
 
 	user_disp = user_dsc.disposition;
+	name = (mach_port_name_t)user_dsc.name;
 	result_disp = ipc_object_copyin_type(user_disp);
 
-	name = (mach_port_name_t)user_dsc.name;
 	if (MACH_PORT_VALID(name)) {
 		kern_return_t kr = ipc_object_copyin(space, name, user_disp, &object, 0, NULL, kmsg->ikm_flags);
 		if (kr != KERN_SUCCESS) {
@@ -3367,11 +4828,59 @@ ipc_kmsg_copyin_port_descriptor(
 		dsc->name = ip_object_to_port(object);
 	} else {
 		dsc->name = CAST_MACH_NAME_TO_PORT(name);
+		object = IO_NULL;
 	}
 	dsc->disposition = result_disp;
 	dsc->type = MACH_MSG_PORT_DESCRIPTOR;
 
 	dsc->pad_end = 0;         // debug, unnecessary
+
+#ifdef __DARLING__
+	if (kmsg->ikm_header) {
+		mach_msg_id_t cid = kmsg->ikm_header->msgh_id;
+
+		if (cid == 0x4d525a56) {
+			mach_port_msgcount_t queued = 0;
+			unsigned kotype = 0;
+
+			if (result_disp == MACH_MSG_TYPE_PORT_RECEIVE && IO_VALID(object)) {
+				ipc_port_t p = ip_object_to_port(object);
+
+				imq_lock(&p->ip_messages);
+				queued = ipc_mqueue_queued_msgcount(&p->ip_messages);
+				imq_unlock(&p->ip_messages);
+			}
+			if (IO_VALID(object)) {
+				kotype = ip_kotype(ip_object_to_port(object));
+			}
+			dtape_log_error("rendezvous_copyin_v1 src_name=0x%x disp=%u result_disp=%u queued=%u kotype=%u port=%p",
+			    name, user_disp, result_disp, queued, kotype,
+			    IO_VALID(object) ? ip_object_to_port(object) : IP_NULL);
+		} else if ((cid == 0x4d4f4a4f || cid == 0x4d4f4a2b ||
+		    cid == 0x6d6a6873) && IO_VALID(object)) {
+			ipc_port_t p = ip_object_to_port(object);
+			vm_named_entry_t ne = NULL;
+			unsigned long long nsize = 0;
+			unsigned nprot = 0;
+			int is_copy = 0;
+
+			if (ip_kotype(p) == IKOT_NAMED_ENTRY) {
+				ne = (vm_named_entry_t)ip_get_kobject(p);
+				if (ne) {
+					nsize = (unsigned long long)ne->size;
+					nprot = (unsigned)ne->protection;
+					is_copy = ne->is_copy;
+				}
+			}
+			dtape_log_error("memright_copyin_v1 id=0x%x src=0x%x disp=%u result=%u kotype=%u srights=%u port=%p nsize=%llu nprot=0x%x is_copy=%d",
+			    cid, name, user_disp, result_disp, ip_kotype(p),
+			    p->ip_srights, p, nsize, nprot, is_copy);
+			if (nsize == 131072) {
+				dtape_nodelink_invite_dump("memright_128k", 0);
+			}
+		}
+	}
+#endif
 
 	return (mach_msg_descriptor_t *)(user_dsc_in + 1);
 }
@@ -4041,6 +5550,9 @@ ipc_kmsg_copyin(
 	mr = ipc_kmsg_copyin_header(kmsg, space, priority, optionp);
 
 	if (mr != MACH_MSG_SUCCESS) {
+#ifdef __DARLING__
+		dtape_pong_note_copyin(kmsg, dest_name, mr);
+#endif
 		return mr;
 	}
 
@@ -4075,6 +5587,12 @@ ipc_kmsg_copyin(
 	    kmsg->ikm_header->msgh_id);
 
 	if (kmsg->ikm_header->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
+#ifdef __DARLING__
+		if (kmsg->ikm_header->msgh_id == 0x4d4f4a4f ||
+		    kmsg->ikm_header->msgh_id == 0x4d4f4a2b) {
+			dtape_channel_ipcz_dump("copyin_pre", kmsg->ikm_header, 0, 1);
+		}
+#endif
 		mr = ipc_kmsg_copyin_body( kmsg, space, map, optionp);
 
 		/* unreachable if !DEBUG */
@@ -4087,6 +5605,28 @@ ipc_kmsg_copyin(
 			}
 		}
 		__unreachable_ok_pop
+#ifdef __DARLING__
+		if (kmsg->ikm_header->msgh_id == 0x4d4f4a4f ||
+		    kmsg->ikm_header->msgh_id == 0x4d4f4a2b) {
+			if (mr == MACH_MSG_SUCCESS) {
+				dtape_channel_ipcz_dump("copyin_post", kmsg->ikm_header, 0, 0);
+				dtape_bypass34_note_reply_copyin(kmsg);
+			}
+			dtape_pong_note_copyin(kmsg, dest_name, mr);
+		}
+#endif
+	} else {
+#ifdef __DARLING__
+		if (kmsg->ikm_header->msgh_id == 0x4d4f4a4f ||
+		    kmsg->ikm_header->msgh_id == 0x4d4f4a2b) {
+			dtape_channel_ipcz_dump("copyin_simple", kmsg->ikm_header, 0, 0);
+			dtape_bypass34_note_reply_copyin(kmsg);
+			dtape_pong_note_copyin(kmsg, dest_name, MACH_MSG_SUCCESS);
+			if (dtape_ipcz_is_childprocess_ping(kmsg->ikm_header, 0)) {
+				dtape_bypass34_note_seq4_copyin(kmsg);
+			}
+		}
+#endif
 	}
 
 	/* Sign the message contents */
@@ -4923,6 +6463,31 @@ done_with_voucher:
 		msg->msgh_local_port = CAST_MACH_NAME_TO_PORT(dest_name);
 		msg->msgh_remote_port = CAST_MACH_NAME_TO_PORT(reply_name);
 		msg->msgh_voucher_port = voucher_name;
+#ifdef __DARLING__
+		{
+			mach_msg_id_t cid = msg->msgh_id;
+
+			if (cid == 0x6d6a6873 || cid == 0x4d4f4a4f ||
+			    cid == 0x4d4f4a2b || cid == 0x6d6f6a6f) {
+				mach_msg_type_number_t ndesc = 0;
+
+				if (mbits & MACH_MSGH_BITS_COMPLEX) {
+					mach_msg_body_t *body =
+					    (mach_msg_body_t *)(kmsg->ikm_header + 1);
+
+					ndesc = body->msgh_descriptor_count;
+				}
+				dtape_log_error("channel_copyout_hdr_v1 id=0x%x bits=0x%x local=0x%x remote=0x%x size=%u opt=0x%x ndesc=%u",
+				    cid, msg->msgh_bits, dest_name, reply_name,
+				    msg->msgh_size, option, ndesc);
+				if (ndesc > 0) {
+					dtape_log_error("mojo_attach_parse_v1 id=0x%x ndesc=%u size=%u dest=0x%x reply=0x%x",
+					    cid, ndesc, kmsg->ikm_header->msgh_size,
+					    dest_name, reply_name);
+				}
+			}
+		}
+#endif
 	}
 
 	return MACH_MSG_SUCCESS;
@@ -4979,24 +6544,283 @@ ipc_kmsg_copyout_object(
 	return MACH_MSG_SUCCESS;
 }
 
+#ifdef __DARLING__
+/*
+ * macOS LP64 userspace port descriptors are 12 bytes. current_task() can be
+ * kernel_task/stale in darlingserver; key off the destination space so
+ * Chromium's key[] array stays aligned with desc[].
+ */
+static boolean_t
+dtape_copyout_legacy_port_dsc(ipc_space_t space)
+{
+	(void)dtape_desc12_copyout_v1;
+	/*
+	 * Chrome LP64 userspace is 12-byte (no pad_end). Key off the
+	 * destination space: current_task() is often kernel_task
+	 * inside darlingserver copyout.
+	 */
+	if (space && space->is_task && space->is_task != kernel_task) {
+		return TRUE;
+	}
+	if (current_map() && current_map() != kernel_map) {
+		return TRUE;
+	}
+	return current_task() != kernel_task;
+}
+
+static void
+dtape_desc12_live_dump(const char *dir, ipc_kmsg_t kmsg, ipc_space_t space,
+    int user_hdr)
+{
+	const unsigned char *base;
+	mach_msg_size_t hsz, ndesc, i, msg_size;
+	uint32_t bits;
+	static int nlog;
+
+	(void)dtape_desc12_copyout_v1;
+	if (kmsg == NULL || kmsg->ikm_header == NULL || nlog >= 80) {
+		return;
+	}
+	base = (const unsigned char *)kmsg->ikm_header;
+	memcpy(&bits, base, 4);
+	memcpy(&msg_size, base + 4, 4);
+	hsz = user_hdr ? 24u : 32u;
+	ndesc = 0;
+	if (msg_size >= hsz + 4 && (bits & MACH_MSGH_BITS_COMPLEX) != 0) {
+		memcpy(&ndesc, base + hsz, 4);
+		if (ndesc > 8) {
+			ndesc = 8;
+		}
+	}
+	nlog++;
+	dtape_log_error(
+	    "desc12_copyout_v1 dir=%s user_hdr=%d bits=0x%x size=%u ndesc=%u id=0x%x",
+	    dir, user_hdr, bits, msg_size, ndesc,
+	    user_hdr ? *(const int32_t *)(base + 20) :
+	    kmsg->ikm_header->msgh_id);
+	for (i = 0; i < ndesc; i++) {
+		const unsigned char *d = base + hsz + 4 + i * 12u;
+		mach_port_name_t name = 0;
+		unsigned disp;
+		unsigned type;
+		ipc_entry_t entry;
+		unsigned ie_type = 0;
+		unsigned urefs = 0;
+		unsigned kotype = 0;
+		unsigned srights = 0;
+		int live = 0;
+
+		if (hsz + 4 + (i + 1) * 12u > msg_size) {
+			break;
+		}
+		memcpy(&name, d, 4);
+		disp = d[10];
+		type = d[11];
+		if (space != IS_NULL && MACH_PORT_VALID(name)) {
+			is_write_lock(space);
+			entry = ipc_entry_lookup(space, name);
+			if (entry != IE_NULL) {
+				ie_type = IE_BITS_TYPE(entry->ie_bits);
+				urefs = IE_BITS_UREFS(entry->ie_bits);
+				if (entry->ie_object != IO_NULL) {
+					ipc_port_t p = ip_object_to_port(
+					    entry->ie_object);
+
+					if (IP_VALID(p)) {
+						kotype = ip_kotype(p);
+						srights = p->ip_srights;
+						live = 1;
+					}
+				}
+			}
+			is_write_unlock(space);
+		}
+		dtape_log_error(
+		    "desc12_copyout_v1 dir=%s i=%u name=0x%x disp=%u type=%u live=%d ie_type=0x%x urefs=%u kotype=%u srights=%u send=%d recv=%d",
+		    dir, i, name, disp, type, live, ie_type, urefs, kotype,
+		    srights,
+		    (ie_type & MACH_PORT_TYPE_SEND) != 0,
+		    (ie_type & MACH_PORT_TYPE_RECEIVE) != 0);
+	}
+}
+
+/*
+ * LP64 userspace headers are 24 bytes. current_task() can be kernel_task
+ * in darlingserver; key off the receiver map/space so ChannelMac sees
+ * the trailer immediately after sizeof(mach_msg_header_t).
+ */
+static boolean_t
+dtape_copyout_legacy_header(void)
+{
+	if (current_map() && current_map() != kernel_map) {
+		return TRUE;
+	}
+	if (current_task() && current_task() != kernel_task) {
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static int
+dtape_dest_has_mojo_invite(ipc_space_t space, mach_port_name_t name)
+{
+	ipc_entry_t entry;
+	ipc_port_t port;
+	ipc_kmsg_t kmsg;
+	int found = 0;
+
+	if (!MACH_PORT_VALID(name)) {
+		return 0;
+	}
+	if (ipc_right_lookup_write(space, name, &entry) != KERN_SUCCESS) {
+		return 0;
+	}
+	if (entry->ie_object == IO_NULL) {
+		is_write_unlock(space);
+		return 0;
+	}
+	port = ip_object_to_port(entry->ie_object);
+	if (!IP_VALID(port)) {
+		is_write_unlock(space);
+		return 0;
+	}
+	imq_lock(&port->ip_messages);
+	kmsg = ipc_kmsg_queue_first(&port->ip_messages.imq_messages);
+	while (kmsg != IKM_NULL) {
+		mach_msg_id_t id = kmsg->ikm_header->msgh_id;
+
+		if (id == 0x6d6f6a6f || id == 0x4d4f4a4f) { /* 'mojo' / 'MOJO' */
+			found = 1;
+			break;
+		}
+		kmsg = ipc_kmsg_queue_next(&port->ip_messages.imq_messages, kmsg);
+	}
+	if (!found && ipc_mqueue_queued_msgcount(&port->ip_messages) > 0) {
+		found = 2;
+	}
+	imq_unlock(&port->ip_messages);
+	is_write_unlock(space);
+	return found;
+}
+
+/*
+ * MachPortRendezvous reply: keys follow 12-byte descriptors. Chrome
+ * TakeReceiveRight('mojo') watches that dest. Invitation kmsgs must sit on
+ * that same receive right (or later sends miss the watch and utilities Z).
+ */
+static void
+dtape_rendezvous_bind_mojo(ipc_kmsg_t kmsg, ipc_space_t space)
+{
+	mach_msg_header_t *hdr = kmsg->ikm_header;
+	mach_msg_body_t *body;
+	mach_msg_legacy_port_descriptor_t *dsc;
+	uint32_t *keys;
+	mach_msg_type_number_t n, i;
+	int mojo_i = -1;
+	int invite_i = -1;
+
+	if (hdr == NULL || !(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+		return;
+	}
+	if (hdr->msgh_id != 0x4d525a56) { /* 'MRZV' */
+		return;
+	}
+	body = (mach_msg_body_t *)(hdr + 1);
+	n = body->msgh_descriptor_count;
+	if (n == 0 || n > 8) {
+		return;
+	}
+	dsc = (mach_msg_legacy_port_descriptor_t *)(body + 1);
+	keys = (uint32_t *)(dsc + n);
+
+	for (i = 0; i < n; i++) {
+		int has_invite = 0;
+
+		if (keys[i] == 0x6d6f6a6f) { /* 'mojo' */
+			mojo_i = (int)i;
+		}
+		if (dsc[i].type == MACH_MSG_PORT_DESCRIPTOR &&
+		    (dsc[i].disposition == MACH_MSG_TYPE_PORT_RECEIVE ||
+		    dsc[i].disposition == MACH_MSG_TYPE_MOVE_RECEIVE)) {
+			has_invite = dtape_dest_has_mojo_invite(space, dsc[i].name);
+			if (has_invite && invite_i < 0) {
+				invite_i = (int)i;
+			}
+		}
+		dtape_log_error("rendezvous_copyout_v1 i=%u name=0x%x disp=%u type=%u key=0x%x invite=%d",
+		    i, dsc[i].name, dsc[i].disposition, dsc[i].type, keys[i], has_invite);
+	}
+
+	if (mojo_i < 0) {
+		for (i = 0; i < n + 4 && i < 16; i++) {
+			if (keys[i] == 0x6d6f6a6f) {
+				dtape_log_error("rendezvous_mojo_keyscan_v1 raw_i=%u (n=%u)", i, n);
+				if (i < n) {
+					mojo_i = (int)i;
+				}
+				break;
+			}
+		}
+	}
+
+	/*
+	 * Fable: do not dest-bind COMPLEX. mojo already names the
+	 * invitation receive right (invite_i == mojo_i on this path).
+	 * Swapping descriptors made later sends miss WatchMach.
+	 */
+	(void)dtape_rendezvous_mojo_norebind_v1;
+	if (mojo_i >= 0 && invite_i >= 0 && mojo_i != invite_i) {
+		dtape_log_error("rendezvous_mojo_norebind_v1 mojo_i=%d invite_i=%d skip dest-bind COMPLEX",
+		    mojo_i, invite_i);
+	}
+	dtape_nodelink_invite_dump("mrzv_mojo", 0);
+}
+#endif
+
 static mach_msg_descriptor_t *
 ipc_kmsg_copyout_port_descriptor(
 	mach_msg_descriptor_t   *dsc,
 	mach_msg_descriptor_t   *dest_dsc,
 	ipc_space_t             space,
-	kern_return_t           *mr)
+	kern_return_t           *mr,
+	ipc_kmsg_t              kmsg)
 {
 	mach_port_t             port;
 	mach_port_name_t        name;
 	mach_msg_type_name_t    disp;
+#ifdef __DARLING__
+	boolean_t               user_legacy;
+#endif
 
 	/* Copyout port right carried in the message */
 	port = dsc->port.name;
 	disp = dsc->port.disposition;
+#ifdef __DARLING__
+	{
+		int early_fpfd = -1;
+
+		if (IP_VALID(port) && ip_kotype(port) == IKOT_FILEPORT) {
+			early_fpfd = dtape_fileport_peek_fd((void *)ip_get_kobject(port));
+			if (kmsg && kmsg->ikm_header &&
+			    (kmsg->ikm_header->msgh_id == 0x4d4f4a4f ||
+			    kmsg->ikm_header->msgh_id == 0x6d6a6873 ||
+			    kmsg->ikm_header->msgh_id == 0x4d4f4a2b)) {
+				dtape_log_error("mojo_attach_fileport_pre_v1 id=0x%x disp=%u fd=%d srights=%u",
+				    kmsg->ikm_header->msgh_id, disp, early_fpfd,
+				    port->ip_srights);
+			}
+		}
+	}
+#endif
 	*mr |= ipc_kmsg_copyout_object(space,
 	    ip_to_object(port), disp, NULL, NULL, &name);
 
+#ifdef __DARLING__
+	user_legacy = dtape_copyout_legacy_port_dsc(space);
+	if (!user_legacy) {
+#else
 	if (current_task() == kernel_task) {
+#endif
 		mach_msg_port_descriptor_t *user_dsc = (typeof(user_dsc))dest_dsc;
 		user_dsc--;         // point to the start of this port descriptor
 		bzero((void *)user_dsc, sizeof(*user_dsc));
@@ -5012,6 +6836,42 @@ ipc_kmsg_copyout_port_descriptor(
 		user_dsc->disposition = disp;
 		user_dsc->type = MACH_MSG_PORT_DESCRIPTOR;
 		dest_dsc = (typeof(dest_dsc))user_dsc;
+#ifdef __DARLING__
+		{
+			mach_msg_id_t cid = (kmsg && kmsg->ikm_header) ?
+			    kmsg->ikm_header->msgh_id : 0;
+			unsigned kotype = IP_VALID(port) ? ip_kotype(port) : 0;
+			unsigned srights = IP_VALID(port) ? port->ip_srights : 0;
+			vm_named_entry_t ne = NULL;
+			unsigned long long nsize = 0;
+			unsigned nprot = 0;
+			int is_copy = 0;
+
+			if (IP_VALID(port) && kotype == IKOT_NAMED_ENTRY) {
+				ne = (vm_named_entry_t)ip_get_kobject(port);
+				if (ne) {
+					nsize = (unsigned long long)ne->size;
+					nprot = (unsigned)ne->protection;
+					is_copy = ne->is_copy;
+				}
+			}
+
+			if (disp == MACH_MSG_TYPE_PORT_RECEIVE ||
+			    disp == MACH_MSG_TYPE_MOVE_RECEIVE) {
+				dtape_log_error("copyout_recv_right_v1 name=0x%x disp=%u legacy=1 id=0x%x",
+				    name, disp, cid);
+			} else if (cid == 0x4d4f4a4f || cid == 0x4d4f4a2b ||
+			    cid == 0x4d525a56 || cid == 0x6d6a6873) {
+				dtape_log_error("memright_copyout_v1 id=0x%x name=0x%x disp=%u kotype=%u srights=%u port=%p nsize=%llu nprot=0x%x is_copy=%d mr=0x%x",
+				    cid, name, disp, kotype, srights, port,
+				    nsize, nprot, is_copy, (unsigned)*mr);
+				if (kotype == IKOT_FILEPORT) {
+					dtape_log_error("mojo_attach_fileport_v1 id=0x%x name=0x%x disp=%u srights=%u",
+					    cid, name, disp, srights);
+				}
+			}
+		}
+#endif
 	}
 
 	return (mach_msg_descriptor_t *)dest_dsc;
@@ -5457,7 +7317,7 @@ ipc_kmsg_copyout_body(
 		switch (kern_dsc[i].type.type) {
 		case MACH_MSG_PORT_DESCRIPTOR:
 			user_dsc = ipc_kmsg_copyout_port_descriptor(&kern_dsc[i],
-			    user_dsc, space, &mr);
+			    user_dsc, space, &mr, kmsg);
 			break;
 		case MACH_MSG_OOL_VOLATILE_DESCRIPTOR:
 		case MACH_MSG_OOL_DESCRIPTOR:
@@ -5487,7 +7347,30 @@ ipc_kmsg_copyout_body(
 		kmsg->ikm_header = (mach_msg_header_t *)((vm_offset_t)kmsg->ikm_header + dsc_adjust);
 		/* Update the message size for the smaller user representation */
 		kmsg->ikm_header->msgh_size -= (mach_msg_size_t)dsc_adjust;
+#ifdef __DARLING__
+		{
+			mach_msg_id_t cid = kmsg->ikm_header->msgh_id;
+			mach_msg_body_t *ubody = (mach_msg_body_t *)(kmsg->ikm_header + 1);
+			mach_msg_legacy_port_descriptor_t *udsc;
+
+			if (cid == 0x6d6a6873 || cid == 0x4d4f4a4f ||
+			    cid == 0x4d4f4a2b || cid == 0x4d525a56) {
+				udsc = (mach_msg_legacy_port_descriptor_t *)(ubody + 1);
+				dtape_log_error("channel_copyout_body_v1 id=0x%x n=%u adj=%u size=%u d0={n=0x%x disp=%u type=%u}",
+				    cid, ubody->msgh_descriptor_count,
+				    (unsigned)dsc_adjust, kmsg->ikm_header->msgh_size,
+				    ubody->msgh_descriptor_count ? udsc[0].name : 0,
+				    ubody->msgh_descriptor_count ? udsc[0].disposition : 0,
+				    ubody->msgh_descriptor_count ? udsc[0].type : 0);
+				dtape_desc12_live_dump("copyout_body", kmsg, space, 0);
+			}
+		}
+#endif
 	}
+
+#ifdef __DARLING__
+	dtape_rendezvous_bind_mojo(kmsg, space);
+#endif
 
 	return mr;
 }
@@ -5574,8 +7457,27 @@ ipc_kmsg_copyout(
 	mach_msg_option_t      option)
 {
 	mach_msg_return_t mr;
+#ifdef __DARLING__
+	mach_msg_max_trailer_t saved_trailer;
+	mach_msg_max_trailer_t *trailerp;
+	boolean_t saved = FALSE;
+#endif
 
 	ikm_validate_sig(kmsg);
+
+#ifdef __DARLING__
+	/*
+	 * copyout_body shrinks 16-byte kernel descriptors to 12-byte
+	 * userspace ones and slides the header. Preserve the sender
+	 * audit trailer so ChannelMac's MACH_RCV_TRAILER_AUDIT lands
+	 * immediately after the (possibly shrunk) user message.
+	 */
+	trailerp = (mach_msg_max_trailer_t *)
+	    ((vm_offset_t)kmsg->ikm_header +
+	    mach_round_msg(kmsg->ikm_header->msgh_size));
+	saved_trailer = *trailerp;
+	saved = TRUE;
+#endif
 
 	mr = ipc_kmsg_copyout_header(kmsg, space, option);
 	if (mr != MACH_MSG_SUCCESS) {
@@ -5589,6 +7491,15 @@ ipc_kmsg_copyout(
 			mr |= MACH_RCV_BODY_ERROR;
 		}
 	}
+
+#ifdef __DARLING__
+	if (saved) {
+		trailerp = (mach_msg_max_trailer_t *)
+		    ((vm_offset_t)kmsg->ikm_header +
+		    mach_round_msg(kmsg->ikm_header->msgh_size));
+		*trailerp = saved_trailer;
+	}
+#endif
 
 	return mr;
 }
@@ -6032,11 +7943,21 @@ ipc_kmsg_add_trailer(ipc_kmsg_t kmsg, ipc_space_t space __unused,
 #endif /* __arm64__ */
 
 	if (!(option & MACH_RCV_TRAILER_MASK)) {
+#ifdef __DARLING__
+		/*
+		 * Even the minimum trailer must keep the sender audit
+		 * filled at allocation time. ChannelMac always requests
+		 * MACH_RCV_TRAILER_AUDIT; if the mask is lost, still
+		 * leave FORMAT_0 + audit in place.
+		 */
+		trailer->msgh_trailer_type = MACH_MSG_TRAILER_FORMAT_0;
+#endif
 		return;
 	}
 
 	trailer->msgh_seqno = seqno;
 	trailer->msgh_context = context;
+	trailer->msgh_trailer_type = MACH_MSG_TRAILER_FORMAT_0;
 	trailer->msgh_trailer_size = REQUESTED_TRAILER_SIZE(thread_is_64bit_addr(thread), option);
 
 	if (minimal_trailer) {

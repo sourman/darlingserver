@@ -68,6 +68,13 @@ enum dserver_kqchan_msgnum {
 	 * A request to read the data for the most recent notification on this proc kqueue channel.
 	 */
 	dserver_kqchan_msgnum_proc_read,
+
+	/**
+	 * ChannelMac notify-only ACK. Restores _canSendNotification without
+	 * filt_machportprocess/fill, which races timeout-0 mach_msg.
+	 * Does NOT require a reply.
+	 */
+	dserver_kqchan_msgnum_mach_port_notify_ack,
 };
 
 typedef enum dserver_kqchan_msgnum dserver_kqchan_msgnum_t;

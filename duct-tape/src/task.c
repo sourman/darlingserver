@@ -18,6 +18,7 @@
 #include <mach/mach_traps.h>
 #include <mach/mach_port.h>
 #include <ipc/ipc_hash.h>
+#include <ipc/ipc_space.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -193,8 +194,22 @@ void dtape_task_release(dtape_task_t* task) {
 	task_deallocate(&task->xnu_task);
 };
 
+__attribute__((used)) static const char dtape_task_dying_ipc_space_terminate_v1[] = "dtape_task_dying_ipc_space_terminate_v1";
+
 void dtape_task_dying(dtape_task_t* task) {
-	// nothing for now
+	/*
+	 * XNU task death calls ipc_space_terminate so MACH_NOTIFY_PORT_DESTROYED
+	 * fires and launchd recovers MachService receive rights. Darling used to
+	 * defer that until dtape_task_destroy, so KeepAlive saw a still-active
+	 * service. ipc_space_terminate is a no-op if the space is already dead.
+	 */
+	(void)dtape_task_dying_ipc_space_terminate_v1;
+	if (!task) {
+		return;
+	}
+	if (task->xnu_task.itk_space) {
+		ipc_space_terminate(task->xnu_task.itk_space);
+	}
 };
 
 void dtape_task_set_dyld_info(dtape_task_t* task, uint64_t address, uint64_t length) {
@@ -705,12 +720,23 @@ void task_name_deallocate(task_name_t task_name) {
 	dtape_stub_unsafe();
 };
 
+__attribute__((used)) static const char task_policy_get_safe_v1[] =
+	"task_policy_get_safe_v1";
+
 kern_return_t task_policy_get(task_t task, task_policy_flavor_t flavor, task_policy_t policy_info, mach_msg_type_number_t* count, boolean_t* get_default) {
-	dtape_stub_unsafe();
+	dtape_stub_safe();
+	(void)task;
+	(void)flavor;
+	(void)get_default;
+	(void)task_policy_get_safe_v1;
+	if (policy_info != NULL && count != NULL && *count > 0) {
+		memset(policy_info, 0, (*count) * sizeof(integer_t));
+	}
+	return KERN_SUCCESS;
 };
 
 void task_policy_get_deallocate(task_policy_get_t task_policy_get) {
-	dtape_stub_unsafe();
+	return task_deallocate((task_t)task_policy_get);
 };
 
 kern_return_t task_policy_set(task_t task, task_policy_flavor_t flavor, task_policy_t policy_info, mach_msg_type_number_t count) {

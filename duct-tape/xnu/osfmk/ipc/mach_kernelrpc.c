@@ -47,6 +47,21 @@ mach_port_get_attributes(
 	mach_port_info_t        info,
 	mach_msg_type_number_t  *count);
 
+kern_return_t
+mach_port_peek(
+	ipc_space_t                     space,
+	mach_port_name_t                name,
+	mach_msg_trailer_type_t         trailer_type,
+	mach_port_seqno_t               *seqnop,
+	mach_msg_size_t                 *msg_sizep,
+	mach_msg_id_t                   *msg_idp,
+	mach_msg_trailer_info_t         trailer_infop,
+	mach_msg_type_number_t          *trailer_sizep);
+
+#ifdef __DARLING__
+#include <darlingserver/duct-tape/log.h>
+#endif
+
 extern lck_mtx_t g_dyldinfo_mtx;
 
 int
@@ -309,9 +324,32 @@ _kernelrpc_mach_port_get_attributes_trap(struct _kernelrpc_mach_port_get_attribu
 	int rv = MACH_SEND_INVALID_DEST;
 	mach_msg_type_number_t count;
 
+#ifdef __DARLING__
+	/*
+	 * args->target is a port name. Resolving it via port_name_to_task()
+	 * uses current_space(); mach_task_self (0x103) in a leftover space
+	 * is the wrong task, so helper 0xc03 was looked up in the browser
+	 * and mps_msgcount stayed 0 after MOVE_RECEIVE. Always inspect the
+	 * calling task's space.
+	 */
+	if (task != current_task()) {
+		if (task) {
+			task_deallocate(task);
+			task = TASK_NULL;
+		}
+		task = current_task();
+		if (task) {
+			task_reference(task);
+		}
+	}
+	if (task == TASK_NULL) {
+		goto done;
+	}
+#else
 	if (task != current_task()) {
 		goto done;
 	}
+#endif
 
 	// MIG does not define the type or size of the mach_port_info_t out array
 	// anywhere, so derive them from the field in the generated reply struct
@@ -348,6 +386,96 @@ _kernelrpc_mach_port_get_attributes_trap(struct _kernelrpc_mach_port_get_attribu
 	if (rv == KERN_SUCCESS && count > 0) {
 		rv = copyout(info, CAST_USER_ADDR_T(args->info), count * sizeof(info[0]));
 	}
+
+done:
+	if (task) {
+		task_deallocate(task);
+	}
+	return rv;
+}
+
+int
+_kernelrpc_mach_port_peek_trap(struct _kernelrpc_mach_port_peek_args *args)
+{
+	task_read_t task = port_name_to_task_read_no_eval(args->target);
+	int rv = MACH_SEND_INVALID_DEST;
+	mach_port_seqno_t seqno = 0;
+	mach_msg_size_t msg_size = 0;
+	mach_msg_id_t msg_id = 0;
+	mach_msg_type_number_t trailer_size = 0;
+	mach_msg_max_trailer_t trailer;
+
+#ifdef __DARLING__
+	if (task != current_task()) {
+		if (task) {
+			task_deallocate(task);
+			task = TASK_NULL;
+		}
+		task = current_task();
+		if (task) {
+			task_reference(task);
+		}
+	}
+	if (task == TASK_NULL) {
+		goto done;
+	}
+#else
+	if (task != current_task()) {
+		goto done;
+	}
+#endif
+
+	if (args->seqnop != 0 &&
+	    copyin(CAST_USER_ADDR_T(args->seqnop), &seqno, sizeof(seqno))) {
+		rv = MACH_SEND_INVALID_DATA;
+		goto done;
+	}
+	if (args->trailer_sizep == 0 ||
+	    copyin(CAST_USER_ADDR_T(args->trailer_sizep), &trailer_size, sizeof(trailer_size))) {
+		rv = MACH_SEND_INVALID_DATA;
+		goto done;
+	}
+	if (trailer_size > sizeof(trailer)) {
+		trailer_size = (mach_msg_type_number_t)sizeof(trailer);
+	}
+	bzero(&trailer, sizeof(trailer));
+
+	rv = mach_port_peek(task->itk_space, args->name, args->trailer_type,
+	    &seqno, &msg_size, &msg_id, (mach_msg_trailer_info_t)&trailer,
+	    &trailer_size);
+	if (rv != KERN_SUCCESS) {
+		goto done;
+	}
+
+	if (args->seqnop != 0 &&
+	    copyout(&seqno, CAST_USER_ADDR_T(args->seqnop), sizeof(seqno))) {
+		rv = MACH_SEND_INVALID_DATA;
+		goto done;
+	}
+	if (args->msg_sizep != 0 &&
+	    copyout(&msg_size, CAST_USER_ADDR_T(args->msg_sizep), sizeof(msg_size))) {
+		rv = MACH_SEND_INVALID_DATA;
+		goto done;
+	}
+	if (args->msg_idp != 0 &&
+	    copyout(&msg_id, CAST_USER_ADDR_T(args->msg_idp), sizeof(msg_id))) {
+		rv = MACH_SEND_INVALID_DATA;
+		goto done;
+	}
+	if (copyout(&trailer_size, CAST_USER_ADDR_T(args->trailer_sizep), sizeof(trailer_size))) {
+		rv = MACH_SEND_INVALID_DATA;
+		goto done;
+	}
+	if (args->trailer_infop != 0 && trailer_size > 0 &&
+	    copyout(&trailer, CAST_USER_ADDR_T(args->trailer_infop), trailer_size)) {
+		rv = MACH_SEND_INVALID_DATA;
+		goto done;
+	}
+
+#ifdef __DARLING__
+	dtape_log_info("mach_port_peek_v1 port=0x%x size=%u id=%d",
+	    args->name, msg_size, msg_id);
+#endif
 
 done:
 	if (task) {

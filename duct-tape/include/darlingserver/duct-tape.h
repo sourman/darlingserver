@@ -30,6 +30,7 @@ uint32_t dtape_mk_timer_create(void);
 
 int dtape_fileport_makeport(int fd, uint32_t* out_name);
 int dtape_fileport_makefd(uint32_t port_name, int* out_fd);
+int dtape_fileport_peek_fd(void* kobject);
 
 DSERVER_DTAPE_DECLS;
 
@@ -115,6 +116,12 @@ void dtape_kqchan_mach_port_modify(dtape_kqchan_mach_port_t* kqchan, uint64_t re
 void dtape_kqchan_mach_port_disable_notifications(dtape_kqchan_mach_port_t* kqchan);
 bool dtape_kqchan_mach_port_fill(dtape_kqchan_mach_port_t* kqchan, dserver_kqchan_reply_mach_port_read_t* reply, uint64_t default_buffer, uint64_t default_buffer_size);
 bool dtape_kqchan_mach_port_has_events(dtape_kqchan_mach_port_t* kqchan);
+unsigned dtape_kqchan_mach_port_msgcount(dtape_kqchan_mach_port_t* kqchan);
+unsigned dtape_kqchan_mach_port_first_msgid(dtape_kqchan_mach_port_t* kqchan);
+int dtape_kqchan_mach_port_first_is_ping(dtape_kqchan_mach_port_t* kqchan);
+int dtape_kqchan_mach_port_first_is_mjhs(dtape_kqchan_mach_port_t* kqchan);
+int dtape_kqchan_mach_port_first_is_offer(dtape_kqchan_mach_port_t* kqchan);
+void dtape_kqchan_gpu_hs20_ack(dtape_kqchan_mach_port_t* kqchan);
 
 void dtape_semaphore_up(dtape_semaphore_t* semaphore);
 dtape_semaphore_wait_result_t dtape_semaphore_down(dtape_semaphore_t* semaphore);

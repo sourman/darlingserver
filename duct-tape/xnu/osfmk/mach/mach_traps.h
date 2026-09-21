@@ -758,6 +758,19 @@ struct _kernelrpc_mach_port_get_attributes_args {
 extern kern_return_t _kernelrpc_mach_port_get_attributes_trap(
 	struct _kernelrpc_mach_port_get_attributes_args *args);
 
+struct _kernelrpc_mach_port_peek_args {
+	PAD_ARG_(mach_port_name_t, target);
+	PAD_ARG_(mach_port_name_t, name);
+	PAD_ARG_(mach_msg_trailer_type_t, trailer_type);
+	PAD_ARG_(user_addr_t, seqnop);
+	PAD_ARG_(user_addr_t, msg_sizep);
+	PAD_ARG_(user_addr_t, msg_idp);
+	PAD_ARG_(user_addr_t, trailer_infop);
+	PAD_ARG_(user_addr_t, trailer_sizep);
+};
+extern kern_return_t _kernelrpc_mach_port_peek_trap(
+	struct _kernelrpc_mach_port_peek_args *args);
+
 struct _kernelrpc_mach_port_insert_member_args {
 	PAD_ARG_(mach_port_name_t, target);
 	PAD_ARG_(mach_port_name_t, name);

@@ -116,6 +116,7 @@ add_executable(darlingserver
 	src/thread.cpp
 	src/utility.cpp
 	src/kqchan.cpp
+	src/rls_wp.cpp
 	src/async-writer.cpp
 	src/stack-pool.cpp
 )

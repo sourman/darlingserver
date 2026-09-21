@@ -698,9 +698,24 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 
 void DarlingServer::Thread::resume() {
 	{
-		std::shared_lock lock(_rwlock);
+		std::unique_lock lock(_rwlock);
 		if (!_suspended) {
-			// maybe we should throw an error here?
+			/*
+			 * thread_go / thread_unblock can run after TH_WAIT is set but
+			 * before suspend() parks this microthread. Dropping that wakeup
+			 * leaves kernelAsync runners asleep with a non-empty queue
+			 * (available > 0, so no replacement runner is spawned). MachPort
+			 * kqchan reads then never get a reply.
+			 *
+			 * Only defer when this thread is still on-CPU (_running): that is
+			 * the park race. A resume of an idle, unparked thread is ignored.
+			 */
+			if (_running) {
+				_rescheduleWhenDone = true;
+				microthreadLog.debug() << _tid << "(" << _nstid
+					<< "): resume before park; defer reschedule"
+					<< microthreadLog.endLog;
+			}
 			return;
 		}
 	}
@@ -1320,7 +1335,10 @@ uintptr_t DarlingServer::Thread::allocatePages(size_t pageCount, int protection,
 	}
 	auto result = _mmap(addressHint, pageCount * sysconf(_SC_PAGESIZE), protection, flags, -1, 0, err);
 	if (result == (uintptr_t)MAP_FAILED) {
-		throw std::system_error(err, std::generic_category(), "S2C mmap call failed");
+		s2cLog.warning() << "S2C mmap(anon) failed errno=" << err
+		                 << " hint=" << (void*)addressHint
+		                 << " pages=" << pageCount << s2cLog.endLog;
+		return 0;
 	}
 	return result;
 };
@@ -1342,7 +1360,10 @@ uintptr_t DarlingServer::Thread::mapFile(int fd, size_t pageCount, int protectio
 	}
 	auto result = _mmap(addressHint, pageCount * sysconf(_SC_PAGESIZE), protection, flags, fd, pageOffset * sysconf(_SC_PAGESIZE), err);
 	if (result == (uintptr_t)MAP_FAILED) {
-		throw std::system_error(err, std::generic_category(), "S2C mmap call failed");
+		s2cLog.warning() << "S2C mmap(file) failed errno=" << err
+		                 << " hint=" << (void*)addressHint
+		                 << " pages=" << pageCount << " fd=" << fd << s2cLog.endLog;
+		return 0;
 	}
 	return result;
 };

@@ -103,6 +103,48 @@
 #include <ipc/ipc_importance.h>
 #endif
 
+#ifdef __DARLING__
+#include <darlingserver/duct-tape/log.h>
+#include <darlingserver/duct-tape/task.h>
+extern int dtape_ipcz_peek(const mach_msg_header_t *hdr, int user_hdr,
+    unsigned *msgid_out, unsigned *seq_out, uint64_t *sublink_out);
+extern int dtape_ipcz_is_childprocess_ping(const mach_msg_header_t *hdr, int user_hdr);
+extern int dtape_ipcz_is_childprocess_pong(const mach_msg_header_t *hdr, int user_hdr);
+
+/*
+ * After MOVE_RECEIVE, Chromium may poll a send-right name that reverse
+ * lookup did not merge with the new receive name. If that send right
+ * names a port whose receive is in this space, report that mqueue.
+ */
+static kern_return_t
+dtape_translate_receive_or_local_send(
+	ipc_space_t space,
+	mach_port_name_t name,
+	ipc_port_t *portp)
+{
+	kern_return_t kr;
+	ipc_object_t object;
+
+	kr = ipc_port_translate_receive(space, name, portp);
+	if (kr == KERN_SUCCESS) {
+		return kr;
+	}
+
+	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &object);
+	if (kr != KERN_SUCCESS) {
+		return kr;
+	}
+	*portp = ip_object_to_port(object);
+	/* port locked */
+	if (!ip_active(*portp) || (*portp)->ip_receiver != space ||
+	    (*portp)->ip_receiver_name == MACH_PORT_NULL) {
+		ip_unlock(*portp);
+		return KERN_INVALID_RIGHT;
+	}
+	return KERN_SUCCESS;
+}
+#endif
+
 kern_return_t mach_port_get_attributes(ipc_space_t space, mach_port_name_t name,
     int flavor, mach_port_info_t info, mach_msg_type_number_t  *count);
 kern_return_t mach_port_get_context(ipc_space_t space, mach_port_name_t name,
@@ -1083,7 +1125,11 @@ mach_port_peek(
 
 	*trailer_sizep = REQUESTED_TRAILER_SIZE(TRUE, trailer_type);
 
+#ifdef __DARLING__
+	kr = dtape_translate_receive_or_local_send(space, name, &port);
+#else
 	kr = ipc_port_translate_receive(space, name, &port);
+#endif
 	if (kr != KERN_SUCCESS) {
 		mach_port_guard_exception(name, 0, 0,
 		    ((KERN_INVALID_NAME == kr) ?
@@ -1872,7 +1918,54 @@ mach_port_get_status_helper(
 	statusp->mps_pset = !!(port->ip_in_pset);
 	statusp->mps_seqno = port->ip_messages.imq_seqno;
 	statusp->mps_qlimit = port->ip_messages.imq_qlimit;
-	statusp->mps_msgcount = port->ip_messages.imq_msgcount;
+	{
+		mach_port_msgcount_t queued;
+		mach_port_msgcount_t imq;
+
+		queued = ipc_mqueue_queued_msgcount(&port->ip_messages);
+		imq = port->ip_messages.imq_msgcount;
+		if (imq < queued) {
+			port->ip_messages.imq_msgcount = queued;
+		}
+		/*
+		 * Pollers (libdispatch MACHPORT, libkqueue EVFILT_MACHPORT)
+		 * key off mps_msgcount. Report kmsgs actually on the queue,
+		 * not reserved sender slots / a stale counter of 0.
+		 */
+		statusp->mps_msgcount = queued;
+#ifdef __DARLING__
+		{
+			static unsigned log_n;
+			uint32_t nsid = 0;
+			dtape_task_t *dt = dtape_task_for_xnu_task(current_task());
+
+			if (dt) {
+				nsid = dt->saved_pid;
+			}
+			/* Always log early polls (queued==0 included) so helper 0xc03 is visible. */
+			if (log_n < 256 || queued > 0 || queued != imq) {
+				if (log_n < 512) {
+					unsigned msgid = 0, seq = 0;
+					uint64_t sub = 0;
+					int ping = 0, pong = 0;
+					ipc_kmsg_t first;
+
+					log_n++;
+					first = ipc_kmsg_queue_first(&port->ip_messages.imq_messages);
+					if (first != IKM_NULL && first->ikm_header != NULL) {
+						(void)dtape_ipcz_peek(first->ikm_header, 0,
+						    &msgid, &seq, &sub);
+						ping = dtape_ipcz_is_childprocess_ping(first->ikm_header, 0);
+						pong = dtape_ipcz_is_childprocess_pong(first->ikm_header, 0);
+					}
+					dtape_log_error("mps_msgcount_v2 nsid=%u recv_name=0x%x imq=%u queued=%u port=%p msgid=%u seq=%u sl=%llu ping=%d pong=%d",
+					    nsid, port->ip_receiver_name, imq, queued, port,
+					    msgid, seq, (unsigned long long)sub, ping, pong);
+				}
+			}
+		}
+#endif
+	}
 	imq_unlock(&port->ip_messages);
 
 	statusp->mps_mscount = port->ip_mscount;
@@ -1956,12 +2049,44 @@ mach_port_get_attributes(
 			return KERN_INVALID_RIGHT;
 		}
 
+#ifdef __DARLING__
+		kr = dtape_translate_receive_or_local_send(space, name, &port);
+#else
 		kr = ipc_port_translate_receive(space, name, &port);
+#endif
 		if (kr != KERN_SUCCESS) {
+#ifdef __DARLING__
+			{
+				static unsigned fail_n;
+				uint32_t nsid = 0;
+				dtape_task_t *dt = dtape_task_for_xnu_task(current_task());
+
+				if (dt) {
+					nsid = dt->saved_pid;
+				}
+				if (fail_n < 64) {
+					fail_n++;
+					dtape_log_error("mps_msgcount_translate_fail_v1 nsid=%u name=0x%x kr=%d",
+					    nsid, name, kr);
+				}
+			}
+#endif
 			return kr;
 		}
 		/* port is locked and active */
 		mach_port_get_status_helper(port, statusp);
+#ifdef __DARLING__
+		if (name != port->ip_receiver_name) {
+			uint32_t nsid = 0;
+			dtape_task_t *dt = dtape_task_for_xnu_task(current_task());
+
+			if (dt) {
+				nsid = dt->saved_pid;
+			}
+			dtape_log_error("mps_msgcount_alias_v1 nsid=%u name=0x%x recv_name=0x%x queued=%u",
+			    nsid, name, port->ip_receiver_name, statusp->mps_msgcount);
+		}
+#endif
 		*count = MACH_PORT_RECEIVE_STATUS_COUNT;
 		ip_unlock(port);
 		break;
@@ -2006,7 +2131,11 @@ mach_port_get_attributes(
 			return KERN_INVALID_RIGHT;
 		}
 
+#ifdef __DARLING__
+		kr = dtape_translate_receive_or_local_send(space, name, &port);
+#else
 		kr = ipc_port_translate_receive(space, name, &port);
+#endif
 		if (kr != KERN_SUCCESS) {
 			return kr;
 		}

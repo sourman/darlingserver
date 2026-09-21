@@ -7,11 +7,15 @@
 #include <kern/debug.h>
 #include <stdlib.h>
 #include <ipc/ipc_mqueue.h>
+#include <ipc/ipc_kmsg.h>
 #include <ipc/ipc_port.h>
 #include <ipc/ipc_space.h>
 #include <kern/thread.h>
 #include <darlingserver/duct-tape/task.h>
 #include <kern/locks.h>
+
+extern int dtape_ipcz_peek(const mach_msg_header_t *hdr, int user_hdr,
+    unsigned *msgid_out, unsigned *seq_out, uint64_t *sublink_out);
 
 extern int filt_machportattach(struct knote *kn, struct kevent_qos_s *kev);
 extern void filt_machportdetach(struct knote *kn);
@@ -86,6 +90,13 @@ dtape_kqchan_mach_port_t* dtape_kqchan_mach_port_create(dtape_task_t* owning_tas
 	dtape_kqchan_list_lock();
 	LIST_INSERT_HEAD(&dtape_all_kqchans, kqchan, all_kqchans);
 	dtape_kqchan_list_unlock();
+
+	if (kqchan->knote.kn_mqueue && owning_task) {
+		dtape_note_gpu_channel_mqueue(kqchan->knote.kn_mqueue,
+		    owning_task->saved_pid);
+		dtape_note_net_channel_mqueue(kqchan->knote.kn_mqueue,
+		    owning_task->saved_pid);
+	}
 
 	return kqchan;
 };
@@ -172,6 +183,172 @@ bool dtape_kqchan_mach_port_has_events(dtape_kqchan_mach_port_t* kqchan) {
 	}
 };
 
+unsigned dtape_kqchan_mach_port_msgcount(dtape_kqchan_mach_port_t* kqchan) {
+	if (!kqchan || !kqchan->knote.kn_mqueue) {
+		return 0;
+	}
+	return ipc_mqueue_queued_msgcount(kqchan->knote.kn_mqueue);
+};
+
+unsigned
+dtape_kqchan_mach_port_first_msgid(dtape_kqchan_mach_port_t* kqchan)
+{
+	ipc_mqueue_t mq;
+	ipc_kmsg_t k;
+	unsigned msgid = 0, seq = 0;
+	uint64_t sub = 0;
+
+	if (!kqchan || !kqchan->knote.kn_mqueue) {
+		return 0;
+	}
+	mq = kqchan->knote.kn_mqueue;
+	k = ipc_kmsg_queue_first(&mq->imq_messages);
+	if (k == IKM_NULL || k->ikm_header == NULL) {
+		return 0;
+	}
+	if (!dtape_ipcz_peek(k->ikm_header, 0, &msgid, &seq, &sub)) {
+		return 0xffffffffu;
+	}
+	return msgid;
+}
+
+extern int dtape_ipcz_is_childprocess_ping(const mach_msg_header_t *hdr, int user_hdr);
+
+int
+dtape_kqchan_mach_port_first_is_ping(dtape_kqchan_mach_port_t* kqchan)
+{
+	ipc_mqueue_t mq;
+	ipc_kmsg_t k;
+
+	if (!kqchan || !kqchan->knote.kn_mqueue) {
+		return 0;
+	}
+	mq = kqchan->knote.kn_mqueue;
+	k = ipc_kmsg_queue_first(&mq->imq_messages);
+	if (k == IKM_NULL || k->ikm_header == NULL) {
+		return 0;
+	}
+	return dtape_ipcz_is_childprocess_ping(k->ikm_header, 0);
+}
+
+int
+dtape_kqchan_mach_port_first_is_mjhs(dtape_kqchan_mach_port_t* kqchan)
+{
+	ipc_mqueue_t mq;
+	ipc_kmsg_t k;
+
+	if (!kqchan || !kqchan->knote.kn_mqueue) {
+		return 0;
+	}
+	mq = kqchan->knote.kn_mqueue;
+	k = ipc_kmsg_queue_first(&mq->imq_messages);
+	if (k == IKM_NULL || k->ikm_header == NULL) {
+		return 0;
+	}
+	return k->ikm_header->msgh_id == 0x6d6a6873;
+}
+
+int
+dtape_kqchan_mach_port_first_is_offer(dtape_kqchan_mach_port_t* kqchan)
+{
+	ipc_mqueue_t mq;
+	ipc_kmsg_t k;
+	unsigned msgid = 0, seq = 0;
+	uint64_t sub = 0;
+
+	if (!kqchan || !kqchan->knote.kn_mqueue) {
+		return 0;
+	}
+	mq = kqchan->knote.kn_mqueue;
+	k = ipc_kmsg_queue_first(&mq->imq_messages);
+	if (k == IKM_NULL || k->ikm_header == NULL) {
+		return 0;
+	}
+	if (!dtape_ipcz_peek(k->ikm_header, 0, &msgid, &seq, &sub) || msgid != 0) {
+		return 0;
+	}
+	return (k->ikm_header->msgh_bits & 0x80000000u) != 0;
+}
+
+extern void dtape_gpu_hs20_ack_release(ipc_mqueue_t mqueue, uint32_t dest_pid);
+
+void
+dtape_kqchan_gpu_hs20_ack(dtape_kqchan_mach_port_t* kqchan)
+{
+	uint32_t pid = 0;
+
+	if (!kqchan) {
+		return;
+	}
+	if (kqchan->task) {
+		pid = kqchan->task->saved_pid;
+	}
+	dtape_gpu_hs20_ack_release(kqchan->knote.kn_mqueue, pid);
+}
+
+extern int dtape_host_cmdline_is_gpu(unsigned nsid);
+extern int dtape_host_cmdline_is_network(unsigned nsid);
+
+unsigned
+dtape_mqueue_kqchan_owner_pid(ipc_mqueue_t mqueue)
+{
+	dtape_kqchan_mach_port_t* kqchan;
+	unsigned pid = 0;
+	unsigned gpu_pid = 0;
+
+	if (!mqueue) {
+		return 0;
+	}
+	dtape_kqchan_list_lock();
+	LIST_FOREACH(kqchan, &dtape_all_kqchans, all_kqchans) {
+		unsigned p;
+
+		if (kqchan->knote.kn_mqueue != mqueue || !kqchan->task) {
+			continue;
+		}
+		p = kqchan->task->saved_pid;
+		if (pid == 0) {
+			pid = p;
+		}
+		if (dtape_host_cmdline_is_gpu(p)) {
+			gpu_pid = p;
+			break;
+		}
+	}
+	dtape_kqchan_list_unlock();
+	return gpu_pid ? gpu_pid : pid;
+}
+
+unsigned
+dtape_mqueue_kqchan_network_owner_pid(ipc_mqueue_t mqueue)
+{
+	dtape_kqchan_mach_port_t* kqchan;
+	unsigned pid = 0;
+	unsigned net_pid = 0;
+
+	if (!mqueue) {
+		return 0;
+	}
+	dtape_kqchan_list_lock();
+	LIST_FOREACH(kqchan, &dtape_all_kqchans, all_kqchans) {
+		unsigned p;
+
+		if (kqchan->knote.kn_mqueue != mqueue || !kqchan->task) {
+			continue;
+		}
+		p = kqchan->task->saved_pid;
+		if (pid == 0) {
+			pid = p;
+		}
+		if (dtape_host_cmdline_is_network(p)) {
+			net_pid = p;
+			break;
+		}
+	}
+	dtape_kqchan_list_unlock();
+	return net_pid ? net_pid : pid;
+}
+
 kevent_ctx_t kevent_get_context(thread_t xthread) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	return &thread->kevent_ctx;
@@ -202,6 +379,91 @@ static void knote_post(struct knote* kn, long hint, ipc_mqueue_t posted) {
 
 	kqchan->callback(kqchan->context);
 };
+
+void dtape_kqchan_notify_mqueue(ipc_mqueue_t mqueue);
+
+/*
+ * Fable inbound flush: kmsgs for sl=2 seq 0–3+Ping sit on the browser
+ * Channel mqueue for ~21ms while IOThread SENDs msgid 34. Do not hold 34
+ * and do not dequeue (steal). Re-notify so FIFO copyout can run as soon
+ * as the send returns, before 35 Deactivate. Length-0 was already written
+ * in userspace; this only wakes the already-queued inbound parcels.
+ */
+__attribute__((used)) static const char dtape_inbound_flush_v1[] = "inbound_flush_v1";
+
+void
+dtape_inbound_flush_before_34(void)
+{
+	dtape_kqchan_mach_port_t *kqchan;
+	dtape_task_t *dt;
+	ipc_mqueue_t mqs[32];
+	unsigned n = 0;
+	unsigned i;
+	task_t t = current_task();
+
+	(void)dtape_inbound_flush_v1;
+	if (t == NULL) {
+		return;
+	}
+	dt = dtape_task_for_xnu_task(t);
+	if (dt == NULL) {
+		return;
+	}
+
+	dtape_kqchan_list_lock();
+	LIST_FOREACH(kqchan, &dtape_all_kqchans, all_kqchans) {
+		ipc_mqueue_t mq;
+
+		if (kqchan->task != dt) {
+			continue;
+		}
+		mq = kqchan->knote.kn_mqueue;
+		if (mq == IMQ_NULL || ipc_kmsg_queue_empty(&mq->imq_messages)) {
+			continue;
+		}
+		if (n < 32) {
+			mqs[n++] = mq;
+		}
+	}
+	dtape_kqchan_list_unlock();
+
+	for (i = 0; i < n; i++) {
+		ipc_mqueue_t mq = mqs[i];
+		ipc_kmsg_t k;
+		unsigned msgid = 0, seq = 0;
+		uint64_t sub = 0;
+		unsigned n20 = 0;
+		unsigned seq0 = ~0u, seqn = 0;
+
+		imq_lock(mq);
+		for (k = ipc_kmsg_queue_first(&mq->imq_messages);
+		    k != IKM_NULL;
+		    k = ipc_kmsg_queue_next(&mq->imq_messages, k)) {
+			msgid = 0;
+			seq = 0;
+			sub = 0;
+			if (k->ikm_header == NULL ||
+			    !dtape_ipcz_peek(k->ikm_header, 0, &msgid, &seq, &sub) ||
+			    msgid != 20 || sub != 2) {
+				continue;
+			}
+			if (seq < seq0) {
+				seq0 = seq;
+			}
+			if (seq > seqn) {
+				seqn = seq;
+			}
+			n20++;
+		}
+		imq_unlock(mq);
+		if (n20 == 0) {
+			continue;
+		}
+		dtape_log_error("inbound_flush_v1 pid=%u n20=%u seq0=%u seqn=%u mq=%p",
+		    dt->saved_pid, n20, seq0, seqn, mq);
+		dtape_kqchan_notify_mqueue(mq);
+	}
+}
 
 void dtape_kqchan_notify_mqueue(ipc_mqueue_t mqueue) {
 	dtape_kqchan_mach_port_t* kqchan;

@@ -116,6 +116,13 @@
 #define offsetof(type, member)  ((size_t)(&((type *)0)->member))
 #endif /* offsetof */
 
+#ifdef __DARLING__
+extern void dtape_channelmac_nested_timeout0_during_send(void);
+extern int dtape_channelmac_nested_timeout0_take(ipc_mqueue_t mqueue,
+    mach_vm_address_t rcv_addr, mach_msg_size_t rcv_size,
+    mach_msg_size_t *out_size);
+#endif
+
 /*
  * Forward declarations - kernel internal routines
  */
@@ -529,6 +536,16 @@ mach_msg_overwrite_trap(
 	/* Only accept options allowed by the user */
 	option &= MACH_MSG_OPTION_USER;
 
+#ifdef __DARLING__
+	/*
+	 * Network helper ChannelMac nested timeout-0 receive during
+	 * Accept+Ping send (not GPU). Bind copyout before Ping copyin.
+	 */
+	if ((option & MACH_SEND_MSG) != 0 && (option & MACH_RCV_MSG) == 0) {
+		dtape_channelmac_nested_timeout0_during_send();
+	}
+#endif
+
 	if (option & MACH_SEND_MSG) {
 		ipc_space_t space = current_space();
 		ipc_kmsg_t kmsg;
@@ -577,6 +594,25 @@ mach_msg_overwrite_trap(
 			goto end;
 		}
 		/* hold ref for object */
+
+#ifdef __DARLING__
+		{
+			mach_vm_address_t take_addr;
+			mach_msg_size_t take_size = 0;
+
+			if (rcv_msg_addr != (mach_vm_address_t)0) {
+				take_addr = rcv_msg_addr;
+			} else {
+				take_addr = msg_addr;
+			}
+			if (dtape_channelmac_nested_timeout0_take(mqueue, take_addr,
+			    rcv_size, &take_size)) {
+				io_release(object);
+				mr = MACH_MSG_SUCCESS;
+				goto end;
+			}
+		}
+#endif
 
 		if ((option & MACH_RCV_SYNC_WAIT) && !(option & MACH_SEND_SYNC_OVERRIDE)) {
 			ipc_port_t special_reply_port;

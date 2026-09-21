@@ -89,6 +89,11 @@
 #include <ipc/ipc_table.h>
 #include <ipc/ipc_importance.h>
 #include <security/mac_mach_internal.h>
+#ifdef __DARLING__
+#include <darlingserver/duct-tape/log.h>
+#include <darlingserver/duct-tape/task.h>
+extern void dtape_kqchan_notify_mqueue(ipc_mqueue_t mqueue);
+#endif
 
 /*
  *	Routine:	ipc_right_lookup_write
@@ -2802,6 +2807,38 @@ ipc_right_copyout(
 		}
 		ipc_port_adjust_port_locked(port, kn, sync_bootstrap_checkin);
 		/* port & message queue are unlocked */
+
+#ifdef __DARLING__
+		/*
+		 * After MOVE_RECEIVE the same ipc_port/mqueue is in the
+		 * destination space. Pollers (libdispatch MACHPORT,
+		 * libkqueue EVFILT_MACHPORT) key off mps_msgcount/peek on
+		 * this dest name; keep imq_msgcount at the real kmsg count
+		 * and wake kqchans attached to this mqueue.
+		 */
+		{
+			mach_port_msgcount_t queued;
+			uint32_t dest_nsid = 0;
+
+			imq_lock(&port->ip_messages);
+			queued = ipc_mqueue_queued_msgcount(&port->ip_messages);
+			if (port->ip_messages.imq_msgcount < queued) {
+				port->ip_messages.imq_msgcount = queued;
+			}
+			imq_unlock(&port->ip_messages);
+			if (space && space->is_task) {
+				dtape_task_t *dt = dtape_task_for_xnu_task(space->is_task);
+				if (dt) {
+					dest_nsid = dt->saved_pid;
+				}
+			}
+			dtape_log_error("move_receive_copyout_v1 dest_nsid=%u dest_name=0x%x queued=%u imq=%u port=%p",
+			    dest_nsid, name, queued, port->ip_messages.imq_msgcount, port);
+			dtape_note_gpu_channel_mqueue(&port->ip_messages, dest_nsid);
+			dtape_note_net_channel_mqueue(&port->ip_messages, dest_nsid);
+			dtape_kqchan_notify_mqueue(&port->ip_messages);
+		}
+#endif
 
 		if (bits & MACH_PORT_TYPE_SEND) {
 			ip_release(port);
