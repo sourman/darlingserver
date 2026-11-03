@@ -369,7 +369,17 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	} else {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
-			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			// Parent exec replacement drops this semaphore while holding
+			// _rwlock, then creates a new one. Death clears it from a
+			// microthread. Signaling a null semaphore kills darlingserver.
+			dtape_semaphore_t* semaphore = nullptr;
+			{
+				std::shared_lock parentLock(parent->_rwlock);
+				semaphore = parent->_dtapeForkWaitSemaphore;
+			}
+			if (semaphore) {
+				dtape_semaphore_up(semaphore);
+			}
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
 		}
 	}
