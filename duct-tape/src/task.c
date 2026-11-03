@@ -521,7 +521,18 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 		};
 
 		default:
-			dtape_stub_unsafe("unimplemented flavor");
+			/*
+			 * Chromium asks for flavors Darling does not model (power, extmod,
+			 * events). Zero-fill the caller buffer instead of aborting the server.
+			 */
+			if (task_info_out != NULL && task_info_count != NULL && *task_info_count > 0) {
+				mach_msg_type_number_t count = *task_info_count;
+				if (count > TASK_INFO_MAX)
+					count = TASK_INFO_MAX;
+				memset(task_info_out, 0, count * sizeof(integer_t));
+				*task_info_count = count;
+			}
+			return KERN_SUCCESS;
 	}
 };
 
