@@ -386,6 +386,9 @@ void vm_map_copy_discard(vm_map_copy_t copy) {
 	if (copy == VM_MAP_COPY_NULL) {
 		return;
 	}
+	if (copy->type == VM_MAP_COPY_MEMFD && copy->cpy_kdata) {
+		dtape_map_shared_descriptor_release((dtape_map_shared_descriptor_t*)copy->cpy_kdata);
+	}
 	free(copy);
 };
 
@@ -526,8 +529,176 @@ kern_return_t mach_vm_allocate_kernel(vm_map_t map, mach_vm_offset_t* addr, mach
 	}
 };
 
+static kern_return_t dtape_memory_entry_from_descriptor(dtape_map_shared_descriptor_t* descriptor, uint64_t file_offset, uint64_t map_size, uint64_t data_offset, vm_prot_t protection, ipc_port_t* object_handle, memory_object_size_t* size_out) {
+	vm_named_entry_t user_entry;
+	vm_map_copy_t copy;
+
+	user_entry = (vm_named_entry_t) kalloc(sizeof(*user_entry));
+	if (user_entry == NULL) {
+		return KERN_RESOURCE_SHORTAGE;
+	}
+	memset(user_entry, 0, sizeof(*user_entry));
+	named_entry_lock_init(user_entry);
+
+	copy = malloc(sizeof(*copy));
+	if (copy == NULL) {
+		kfree(user_entry, sizeof(*user_entry));
+		return KERN_RESOURCE_SHORTAGE;
+	}
+	memset(copy, 0, sizeof(*copy));
+	copy->type = VM_MAP_COPY_MEMFD;
+	copy->size = map_size;
+	copy->offset = file_offset;
+	copy->cpy_kdata = descriptor;
+
+	user_entry->backing.copy = copy;
+	user_entry->is_copy = TRUE;
+	user_entry->size = map_size;
+	user_entry->offset = file_offset;
+	user_entry->data_offset = data_offset;
+	user_entry->protection = protection & VM_PROT_ALL;
+	user_entry->ref_count = 1;
+
+	*object_handle = ipc_kobject_alloc_port((ipc_kobject_t)user_entry, IKOT_NAMED_ENTRY, IPC_KOBJECT_ALLOC_MAKE_SEND | IPC_KOBJECT_ALLOC_NSREQUEST);
+	*size_out = map_size - data_offset;
+	return KERN_SUCCESS;
+};
+
 kern_return_t _mach_make_memory_entry(vm_map_t target_map, memory_object_size_t* size, memory_object_offset_t offset, vm_prot_t permission, ipc_port_t* object_handle, ipc_port_t parent_entry) {
-	dtape_stub_unsafe();
+	kern_return_t kr = KERN_SUCCESS;
+	int memfd = -1;
+	void* mapped_addr = NULL;
+	dtape_map_shared_descriptor_t* descriptor = NULL;
+	dtape_memory_region_info_t region_info;
+	int prot = PROT_READ | PROT_WRITE;
+	uintptr_t start_memaddr;
+	uintptr_t end_memaddr;
+	size_t map_size;
+	uint64_t data_offset;
+	uint64_t file_offset = 0;
+	boolean_t named_create;
+
+	if (size == NULL || object_handle == NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	*object_handle = IP_NULL;
+
+	named_create = (permission & MAP_MEM_NAMED_CREATE) != 0;
+	if (*size == 0) {
+		return KERN_SUCCESS;
+	}
+
+	if (IP_VALID(parent_entry) && ip_kotype(parent_entry) == IKOT_NAMED_ENTRY) {
+		vm_named_entry_t parent = (vm_named_entry_t) ip_get_kobject(parent_entry);
+		vm_map_copy_t parent_copy = parent->backing.copy;
+		uint64_t parent_off;
+		uint64_t child_off;
+
+		if (!parent->is_copy || parent_copy == NULL || parent_copy->type != VM_MAP_COPY_MEMFD) {
+			return KERN_INVALID_ARGUMENT;
+		}
+		if (offset > parent->size || *size > parent->size - offset) {
+			return KERN_INVALID_ARGUMENT;
+		}
+
+		parent_off = mach_vm_trunc_page(parent->offset + offset);
+		child_off = (parent->offset + offset) - parent_off;
+		end_memaddr = mach_vm_round_page(parent->offset + offset + *size);
+		map_size = end_memaddr - parent_off;
+		descriptor = (dtape_map_shared_descriptor_t*) parent_copy->cpy_kdata;
+		dtape_map_shared_descriptor_retain(descriptor);
+		kr = dtape_memory_entry_from_descriptor(descriptor, parent_off, map_size, child_off, permission, object_handle, size);
+		if (kr != KERN_SUCCESS) {
+			dtape_map_shared_descriptor_release(descriptor);
+		}
+		return kr;
+	}
+
+	end_memaddr = mach_vm_round_page(offset + *size);
+	start_memaddr = mach_vm_trunc_page(offset);
+	map_size = end_memaddr - start_memaddr;
+	data_offset = offset - start_memaddr;
+	if (map_size == 0) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	memfd = memfd_create("darling-memory-entry", MFD_CLOEXEC);
+	if (memfd < 0) {
+		return KERN_RESOURCE_SHORTAGE;
+	}
+	if (ftruncate(memfd, map_size) < 0) {
+		kr = KERN_RESOURCE_SHORTAGE;
+		goto out;
+	}
+
+	descriptor = dtape_map_shared_descriptor_create(memfd, map_size);
+	if (!descriptor) {
+		kr = KERN_RESOURCE_SHORTAGE;
+		goto out;
+	}
+	memfd = -1;
+
+	if (!named_create) {
+		if (target_map == VM_MAP_NULL) {
+			kr = KERN_INVALID_ARGUMENT;
+			goto out;
+		}
+		if (!dtape_hooks->task_get_memory_region_info(target_map->dtape_task->context, start_memaddr, &region_info)) {
+			kr = KERN_INVALID_ADDRESS;
+			goto out;
+		}
+		prot = 0;
+		if (region_info.protection & dtape_memory_protection_read) {
+			prot |= PROT_READ;
+		}
+		if (region_info.protection & dtape_memory_protection_write) {
+			prot |= PROT_WRITE;
+		}
+		if (region_info.protection & dtape_memory_protection_execute) {
+			prot |= PROT_EXEC;
+		}
+
+		mapped_addr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor->memfd, 0);
+		if (mapped_addr == MAP_FAILED) {
+			mapped_addr = NULL;
+			kr = KERN_RESOURCE_SHORTAGE;
+			goto out;
+		}
+		kr = copyinmap(target_map, start_memaddr, mapped_addr, map_size);
+		if (kr != KERN_SUCCESS) {
+			goto out;
+		}
+		if (dtape_hooks->task_map_file(target_map->dtape_task->context, descriptor->memfd, dtape_byte_count_to_page_count_round_up(map_size), prot, start_memaddr, 0, dtape_memory_flag_fixed | dtape_memory_flag_overwrite) != start_memaddr) {
+			kr = KERN_FAILURE;
+			goto out;
+		}
+		{
+			dtape_map_shared_entry_t* src_shared_entry = dtape_map_shared_entry_create(start_memaddr, map_size, 0, descriptor);
+			if (!src_shared_entry) {
+				kr = KERN_RESOURCE_SHORTAGE;
+				goto out;
+			}
+			dtape_map_insert_shared_entry(target_map, src_shared_entry);
+		}
+	}
+
+	kr = dtape_memory_entry_from_descriptor(descriptor, file_offset, map_size, data_offset, permission, object_handle, size);
+	if (kr != KERN_SUCCESS) {
+		goto out;
+	}
+	descriptor = NULL;
+
+out:
+	if (mapped_addr) {
+		munmap(mapped_addr, map_size);
+	}
+	if (memfd >= 0) {
+		close(memfd);
+	}
+	if (descriptor) {
+		dtape_map_shared_descriptor_release(descriptor);
+	}
+	return kr;
 };
 
 kern_return_t mach_memory_entry_access_tracking(ipc_port_t entry_port, int* access_tracking, uint32_t* access_tracking_reads, uint32_t* access_tracking_writes) {
@@ -591,7 +762,69 @@ kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t addr, ma
 };
 
 kern_return_t mach_vm_map_external(vm_map_t target_map, mach_vm_offset_t* address, mach_vm_size_t initial_size, mach_vm_offset_t mask, int flags, ipc_port_t port, vm_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance) {
-	dtape_stub_safe();
+	vm_named_entry_t named;
+	vm_map_copy_t named_copy;
+	dtape_map_shared_descriptor_t* descriptor;
+	dtape_map_shared_entry_t* shared_entry;
+	int prot = 0;
+	dtape_memory_flags_t memflags = dtape_memory_flag_none;
+	uintptr_t hint = 0;
+	uintptr_t mapped;
+	uint64_t file_offset;
+	uint64_t map_size;
+
+	if (!(IP_VALID(port) && ip_kotype(port) == IKOT_NAMED_ENTRY)) {
+		dtape_stub_safe();
+		return KERN_SUCCESS;
+	}
+	if (target_map == VM_MAP_NULL || address == NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	named = (vm_named_entry_t) ip_get_kobject(port);
+	named_copy = named->backing.copy;
+	if (!named->is_copy || named_copy == NULL || named_copy->type != VM_MAP_COPY_MEMFD) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	descriptor = (dtape_map_shared_descriptor_t*) named_copy->cpy_kdata;
+	file_offset = named->offset + offset;
+	map_size = initial_size ? initial_size : named->size;
+	if (map_size == 0 || file_offset > descriptor->size || map_size > descriptor->size - file_offset) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	if ((cur_protection & VM_PROT_READ) && (named->protection & VM_PROT_READ)) {
+		prot |= PROT_READ;
+	}
+	if ((cur_protection & VM_PROT_WRITE) && (named->protection & VM_PROT_WRITE)) {
+		prot |= PROT_WRITE;
+	}
+	if ((cur_protection & VM_PROT_EXECUTE) && (named->protection & VM_PROT_EXECUTE)) {
+		prot |= PROT_EXEC;
+	}
+	if (prot == 0) {
+		prot = PROT_READ;
+	}
+
+	if (!(flags & VM_FLAGS_ANYWHERE)) {
+		hint = *address;
+		memflags = dtape_memory_flag_fixed;
+	}
+
+	mapped = dtape_hooks->task_map_file(target_map->dtape_task->context, descriptor->memfd, dtape_byte_count_to_page_count_round_up(map_size), prot, hint, file_offset / sysconf(_SC_PAGESIZE), memflags);
+	if (!mapped) {
+		return KERN_FAILURE;
+	}
+
+	shared_entry = dtape_map_shared_entry_create(mapped, map_size, file_offset, descriptor);
+	if (shared_entry) {
+		dtape_map_insert_shared_entry(target_map, shared_entry);
+	}
+
+	*address = mapped;
+	if (flags & VM_FLAGS_RETURN_DATA_ADDR) {
+		*address += named->data_offset;
+	}
 	return KERN_SUCCESS;
 };
 
