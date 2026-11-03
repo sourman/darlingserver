@@ -326,6 +326,11 @@ struct DTapeHooks {
 		try {
 			return static_cast<DarlingServer::Process*>(task_context)->mapFile(fd, page_count, protection, address_hint, page_offset, flags & dtape_memory_flag_fixed, flags & dtape_memory_flag_overwrite);
 		} catch (std::system_error e) {
+			static DarlingServer::Log mapFileLog("mapfile");
+			mapFileLog.error() << "task_map_file failed: " << e.what() << " errno=" << e.code().value()
+				<< " fd=" << fd << " pages=" << page_count << " prot=" << protection
+				<< " hint=" << address_hint << " page_off=" << page_offset << " flags=" << (int)flags
+				<< mapFileLog.endLog;
 			return 0;
 		}
 	};

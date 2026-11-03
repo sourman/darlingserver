@@ -778,18 +778,32 @@ kern_return_t mach_vm_map_external(vm_map_t target_map, mach_vm_offset_t* addres
 		return KERN_SUCCESS;
 	}
 	if (target_map == VM_MAP_NULL || address == NULL) {
+		dtape_log_error("mach_vm_map_external: null map or address");
 		return KERN_INVALID_ARGUMENT;
 	}
 
 	named = (vm_named_entry_t) ip_get_kobject(port);
 	named_copy = named->backing.copy;
+	/*
+	 * Chromium's read-only shared-memory check maps the entry with
+	 * VM_PROT_READ|VM_PROT_WRITE and expects KERN_INVALID_RIGHT. Mapping it
+	 * anyway and returning success makes TakeOrFail fail closed.
+	 */
+	if (((cur_protection | max_protection) & VM_PROT_ALL & ~named->protection) != 0) {
+		return KERN_INVALID_RIGHT;
+	}
 	if (!named->is_copy || named_copy == NULL || named_copy->type != VM_MAP_COPY_MEMFD) {
+		dtape_log_error("mach_vm_map_external: entry is not a memfd copy (is_copy=%d type=%d)",
+		    named->is_copy, named_copy ? named_copy->type : -1);
 		return KERN_INVALID_ARGUMENT;
 	}
 	descriptor = (dtape_map_shared_descriptor_t*) named_copy->cpy_kdata;
 	file_offset = named->offset + offset;
 	map_size = initial_size ? initial_size : named->size;
 	if (map_size == 0 || file_offset > descriptor->size || map_size > descriptor->size - file_offset) {
+		dtape_log_error("mach_vm_map_external: bad range size=%llu offset=%llu descriptor=%llu named_off=%llu named_size=%llu",
+		    (unsigned long long)map_size, (unsigned long long)file_offset, (unsigned long long)descriptor->size,
+		    (unsigned long long)named->offset, (unsigned long long)named->size);
 		return KERN_INVALID_ARGUMENT;
 	}
 
@@ -813,6 +827,9 @@ kern_return_t mach_vm_map_external(vm_map_t target_map, mach_vm_offset_t* addres
 
 	mapped = dtape_hooks->task_map_file(target_map->dtape_task->context, descriptor->memfd, dtape_byte_count_to_page_count_round_up(map_size), prot, hint, file_offset / sysconf(_SC_PAGESIZE), memflags);
 	if (!mapped) {
+		dtape_log_error("mach_vm_map_external: task_map_file failed fd=%d pages=%llu prot=%d hint=%llx off=%llu flags=%d",
+		    descriptor->memfd, (unsigned long long)dtape_byte_count_to_page_count_round_up(map_size), prot,
+		    (unsigned long long)hint, (unsigned long long)(file_offset / sysconf(_SC_PAGESIZE)), memflags);
 		return KERN_FAILURE;
 	}
 
