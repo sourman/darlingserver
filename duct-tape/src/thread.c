@@ -549,6 +549,17 @@ wait_result_t thread_block(thread_continue_t continuation) {
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	thread->xnu_thread.wait_result = wresult;
+	/*
+	 * XNU cancels a pending wait timer here. Leaving it armed makes the
+	 * timer expire into a later unbounded receive (MACH_RCV_TIMED_OUT),
+	 * which libdispatch treats as fatal in a sync XPC reply wait.
+	 */
+	if (thread->xnu_thread.wait_timer_is_set) {
+		if (timer_call_cancel(&thread->xnu_thread.wait_timer)) {
+			thread->xnu_thread.wait_timer_active--;
+		}
+		thread->xnu_thread.wait_timer_is_set = FALSE;
+	}
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;
 };
