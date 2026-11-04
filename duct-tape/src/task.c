@@ -559,7 +559,12 @@ void task_name_deallocate(task_name_t task_name) {
 };
 
 kern_return_t task_policy_get(task_t task, task_policy_flavor_t flavor, task_policy_t policy_info, mach_msg_type_number_t* count, boolean_t* get_default) {
-	dtape_stub_unsafe();
+	dtape_stub_safe();
+	if (policy_info && count && *count > 0 && *count < 64)
+		memset(policy_info, 0, (*count) * sizeof(integer_t));
+	if (get_default)
+		*get_default = FALSE;
+	return KERN_SUCCESS;
 };
 
 void task_policy_get_deallocate(task_policy_get_t task_policy_get) {
