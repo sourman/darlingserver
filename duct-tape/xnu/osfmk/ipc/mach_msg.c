@@ -395,6 +395,34 @@ mach_msg_receive_results(
 	/* Save destination port context for the trailer before copyout */
 	context = kmsg->ikm_header->msgh_remote_port->ip_context;
 
+	{
+		extern int dtape_thread_waits_high_set(thread_t);
+		extern int open(const char *path, int flags, ...);
+		extern long write(int fd, const void *buf, unsigned long n);
+		extern int close(int fd);
+		static int n;
+		char line[180];
+		int fd;
+		unsigned long len = 0;
+		if (dtape_thread_waits_high_set(self) && n < 40) {
+			n++;
+			snprintf(line, sizeof(line),
+			    "rcv tid=%llu bits=0x%x id=%d size=%u\n",
+			    (unsigned long long)self->thread_id,
+			    kmsg->ikm_header->msgh_bits,
+			    kmsg->ikm_header->msgh_id,
+			    kmsg->ikm_header->msgh_size);
+			while (line[len] != '\0') {
+				len++;
+			}
+			fd = open("/tmp/mqrcv.log", 0x441, 0644);
+			if (fd >= 0) {
+				write(fd, line, len);
+				close(fd);
+			}
+		}
+	}
+
 	mr = ipc_kmsg_copyout(kmsg, space, map, MACH_MSG_BODY_NULL, option);
 
 	trailer_size = ipc_kmsg_trailer_size(option, self);
@@ -421,6 +449,31 @@ mach_msg_receive_results(
 		self->ith_qos_override = kmsg->ikm_qos_override;
 		ipc_kmsg_add_trailer(kmsg, space, option, self, seqno, FALSE, context);
 		mr = ipc_kmsg_put(kmsg, option, rcv_addr, rcv_size, trailer_size, &size);
+	}
+
+	{
+		extern int dtape_thread_waits_high_set(thread_t);
+		extern int open(const char *path, int flags, ...);
+		extern long write(int fd, const void *buf, unsigned long n);
+		extern int close(int fd);
+		static int n;
+		char line[120];
+		int fd;
+		unsigned long len = 0;
+		if (dtape_thread_waits_high_set(self) && n < 40) {
+			n++;
+			snprintf(line, sizeof(line),
+			    "rcv done tid=%llu mr=0x%x\n",
+			    (unsigned long long)self->thread_id, mr);
+			while (line[len] != '\0') {
+				len++;
+			}
+			fd = open("/tmp/mqrcv.log", 0x441, 0644);
+			if (fd >= 0) {
+				write(fd, line, len);
+				close(fd);
+			}
+		}
 	}
 
 	if (sizep) {

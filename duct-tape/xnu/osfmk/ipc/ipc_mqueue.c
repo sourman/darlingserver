@@ -984,6 +984,23 @@ dtape_wake_log(const char *line)
 	close(fd);
 }
 
+int
+dtape_thread_waits_high_set(thread_t thread)
+{
+	int i;
+
+	if (thread == THREAD_NULL) {
+		return 0;
+	}
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		if (dtape_set_waits[i].thread == thread &&
+		    dtape_set_waits[i].wqset >= 262158) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 void
 dtape_note_set_wait(thread_t thread, mach_port_name_t name, ipc_mqueue_t mqueue)
 {
