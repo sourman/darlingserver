@@ -521,7 +521,18 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 		};
 
 		default:
-			dtape_stub_unsafe("unimplemented flavor");
+			/*
+			 * Chromium asks for flavors Darling does not model (power, extmod,
+			 * events). Zero-fill the caller buffer instead of aborting the server.
+			 */
+			if (task_info_out != NULL && task_info_count != NULL && *task_info_count > 0) {
+				mach_msg_type_number_t count = *task_info_count;
+				if (count > TASK_INFO_MAX)
+					count = TASK_INFO_MAX;
+				memset(task_info_out, 0, count * sizeof(integer_t));
+				*task_info_count = count;
+			}
+			return KERN_SUCCESS;
 	}
 };
 
@@ -548,11 +559,16 @@ void task_name_deallocate(task_name_t task_name) {
 };
 
 kern_return_t task_policy_get(task_t task, task_policy_flavor_t flavor, task_policy_t policy_info, mach_msg_type_number_t* count, boolean_t* get_default) {
-	dtape_stub_unsafe();
+	dtape_stub_safe();
+	if (policy_info && count && *count > 0 && *count < 64)
+		memset(policy_info, 0, (*count) * sizeof(integer_t));
+	if (get_default)
+		*get_default = FALSE;
+	return KERN_SUCCESS;
 };
 
 void task_policy_get_deallocate(task_policy_get_t task_policy_get) {
-	dtape_stub_unsafe();
+	task_deallocate((task_t)task_policy_get);
 };
 
 kern_return_t task_policy_set(task_t task, task_policy_flavor_t flavor, task_policy_t policy_info, mach_msg_type_number_t count) {

@@ -184,6 +184,14 @@ mig(xnu/osfmk/mach/mach_host.defs)
 mig(xnu/osfmk/mach/mach_notify.defs)
 mig(xnu/osfmk/mach/mach_port.defs)
 mig(xnu/osfmk/mach/mach_vm.defs)
+# libsystem's vm_map stub sends the named entry as COPY_SEND. See
+# fix-mach-vm-map-disposition.py.
+add_custom_command(
+	OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/xnu/osfmk/mach/mach_vm_server.c
+	APPEND
+	COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/fix-mach-vm-map-disposition.py
+		${CMAKE_CURRENT_BINARY_DIR}/xnu/osfmk/mach/mach_vm_server.c
+)
 mig(xnu/osfmk/mach/mach_voucher.defs)
 mig(xnu/osfmk/mach/mach_voucher_attr_control.defs)
 mig(xnu/osfmk/mach/memory_entry.defs)

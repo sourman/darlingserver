@@ -1226,7 +1226,11 @@ mach_port_get_context(
 
 	kr = ipc_port_translate_receive(space, name, &port);
 	if (kr != KERN_SUCCESS) {
-		return kr;
+		/* A moved send right keeps the same ipc_port. IOSurface stashes the
+		 * surface id in the context and the other task only holds the send right. */
+		kr = ipc_port_translate_send(space, name, &port);
+		if (kr != KERN_SUCCESS)
+			return kr;
 	}
 
 	/* Port locked and active */

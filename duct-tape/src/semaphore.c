@@ -31,6 +31,9 @@ void dtape_semaphore_destroy(dtape_semaphore_t* semaphore) {
 };
 
 void dtape_semaphore_up(dtape_semaphore_t* semaphore) {
+	if (!semaphore) {
+		return;
+	}
 	if (semaphore_signal(semaphore->xnu_semaphore) != KERN_SUCCESS) {
 		panic("Failed to raise up-count of duct-taped XNU semaphore");
 	}

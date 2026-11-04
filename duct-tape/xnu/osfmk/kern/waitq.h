@@ -449,6 +449,26 @@ extern boolean_t waitq_member(struct waitq *waitq, struct waitq_set *wqset);
 /* returns true if the waitq is in at least 1 set */
 extern boolean_t waitq_in_set(struct waitq *waitq);
 
+/* Caller holds waitq. Makes a port-set receive visible to waitq_select. */
+extern void waitq_hint_set_waiter(struct waitq *waitq);
+
+/* In-memory trace. Safe to call while a waitq lock is held. */
+extern void dtape_wake_note(const char *line);
+extern void dtape_wake_flush(void);
+extern void dtape_wake_mark_handed(void);
+extern void dtape_wake_clear_handed(void);
+extern int dtape_wake_handed(void);
+
+/*
+ * The port-set waiter may sit on a different global FIFO queue than the
+ * one waitq_select hashes to. Claim it if it is waiting on 'waitq'.
+ * Caller holds 'waitq'. Returns the thread locked, or THREAD_NULL.
+ */
+extern thread_t waitq_claim_set_receiver(struct waitq *waitq, spl_t *spl);
+extern thread_t waitq_claim_waitq_receiver(struct waitq *waitq, event64_t event, spl_t *spl);
+extern void waitq_prepost_locked(struct waitq *waitq, struct waitq_set *wqset, uint64_t *reserved);
+extern void waitq_prepost_linked_sets(struct waitq *waitq, uint64_t *reserved);
+
 
 /* on success, consumes an reserved_link reference */
 extern kern_return_t waitq_link(struct waitq *waitq,
