@@ -2482,8 +2482,16 @@ do_waitq_select_n_locked(struct waitq_select_args *args)
 	 * If the safeq doesn't have an eventmask (not global) or the event
 	 * we're looking for IS set in its eventmask, then scan the threads
 	 * in that queue for ones that match the original <waitq,event> pair.
+	 *
+	 * A port-set receive parks on the global FIFO queue. That queue's
+	 * eventmask is a hint and drops the waiter, so CFRunLoopWakeUp's
+	 * send stops in this function: the thread is never selected, the
+	 * message is queued on the wake port, and the client's recvmsg
+	 * socket is never written. Scan the set anyway. Turnstile queues
+	 * still honor the mask; they assert every thread matches the event.
 	 */
 	if (!waitq_is_global(safeq) ||
+	    waitq_is_set(waitq) ||
 	    (safeq->waitq_eventmask & eventmask) == eventmask) {
 		if (waitq_is_turnstile_queue(safeq)) {
 			first_thread = waitq_prioq_iterate_locked(safeq, waitq,

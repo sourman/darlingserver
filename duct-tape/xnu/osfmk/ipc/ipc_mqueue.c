@@ -520,6 +520,56 @@ ipc_mqueue_changed(
  *		MACH_SEND_TIMED_OUT	Caller still has message.
  *		MACH_SEND_INTERRUPTED	Caller still has message.
  */
+/*
+ * CFRunLoopWakeUp sends with MACH_SEND_TIMEOUT and a timeout of 0.
+ * Once one message sits on the wake port, the next send stops here:
+ * the queue is full, so we return MACH_SEND_TIMED_OUT and never call
+ * ipc_mqueue_post. The run loop is blocked in a set receive, which
+ * only sees preposts, so its recvmsg socket is never written.
+ * Hand the queued message to that set waiter.
+ *
+ * mqueue is locked.
+ */
+static void
+ipc_mqueue_handoff_full_to_set(ipc_mqueue_t mqueue)
+{
+	ipc_object_t object;
+	ipc_kmsg_t kmsg;
+	thread_t receiver;
+	spl_t th_spl;
+	uint64_t reserved_prepost = 0;
+
+	if (imq_is_set(mqueue) || ipc_kmsg_queue_empty(&mqueue->imq_messages)) {
+		return;
+	}
+	object = imq_to_object(mqueue);
+	if (io_otype(object) != IOT_PORT) {
+		return;
+	}
+	receiver = ipc_pset_wake_member(ip_object_to_port(object),
+	    &th_spl, &reserved_prepost);
+	if (receiver == THREAD_NULL) {
+		return;
+	}
+	if (receiver->ith_state != MACH_RCV_IN_PROGRESS) {
+		thread_unlock(receiver);
+		splx(th_spl);
+		return;
+	}
+	kmsg = ipc_kmsg_dequeue(&mqueue->imq_messages);
+	if (kmsg == IKM_NULL) {
+		thread_unlock(receiver);
+		splx(th_spl);
+		return;
+	}
+	receiver->ith_state = MACH_MSG_SUCCESS;
+	receiver->ith_kmsg = kmsg;
+	receiver->ith_seqno = mqueue->imq_seqno++;
+	thread_unlock(receiver);
+	splx(th_spl);
+	ipc_mqueue_release_msgcount(mqueue, IMQ_NULL);
+}
+
 mach_msg_return_t
 ipc_mqueue_send(
 	ipc_mqueue_t            mqueue,
@@ -553,6 +603,7 @@ ipc_mqueue_send(
 		 * We have to wait for space to be granted to us.
 		 */
 		if ((option & MACH_SEND_TIMEOUT) && (send_timeout == 0)) {
+			ipc_mqueue_handoff_full_to_set(mqueue);
 			imq_unlock(mqueue);
 			return MACH_SEND_TIMED_OUT;
 		}
