@@ -805,6 +805,9 @@ ipc_mqueue_post(
 {
 	uint64_t reserved_prepost = 0;
 	boolean_t destroy_msg = FALSE;
+	int handed = 0;
+	int queued = 0;
+	uint64_t set_id_log = 0;
 
 	ipc_kmsg_trace_send(kmsg, option);
 
@@ -815,6 +818,7 @@ ipc_mqueue_post(
 	 *	Check for a receiver for the message.
 	 */
 	imq_reserve_and_lock(mqueue, &reserved_prepost);
+	set_id_log = mqueue->imq_wait_queue.waitq_set_id;
 
 	/* we may have raced with port destruction! */
 	if (!imq_valid(mqueue)) {
@@ -870,6 +874,7 @@ ipc_mqueue_post(
 			 * logic below).
 			 */
 			if (mqueue->imq_msgcount > 0) {
+				queued = 1;
 				if (ipc_kmsg_enqueue_qos(&mqueue->imq_messages, kmsg)) {
 					/* if the space is dead there is no point calling KNOTE */
 					ipc_object_t object = imq_to_object(mqueue);
@@ -947,6 +952,7 @@ ipc_mqueue_post(
 		    !(receiver->ith_option & MACH_RCV_LARGE)) {
 			receiver->ith_kmsg = kmsg;
 			receiver->ith_seqno = mqueue->imq_seqno++;
+			handed = 1;
 #if MACH_FLIPC
 			mach_node_t node = kmsg->ikm_node;
 #endif
@@ -980,6 +986,18 @@ out_unlock:
 	/* clear the waitq boost we may have been given */
 	waitq_clear_promotion_locked(&mqueue->imq_wait_queue, current_thread());
 	imq_release_and_unlock(mqueue, reserved_prepost);
+	if (set_id_log != 0 || handed) {
+		char line[160];
+		extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+		snprintf(line, sizeof(line),
+		    "post set_id=%llu handed=%d queued=%d\n",
+		    (unsigned long long)set_id_log, handed, queued);
+		dtape_wake_note(line);
+		if (handed) {
+			dtape_wake_mark_handed();
+		}
+		dtape_wake_flush();
+	}
 	if (destroy_msg) {
 		ipc_kmsg_destroy(kmsg);
 	}

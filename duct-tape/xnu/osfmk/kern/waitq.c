@@ -1878,6 +1878,161 @@ waitq_get_safeq(struct waitq *waitq)
  * queue, so a send to a member never wakes the run loop. Set the bit
  * for this set before the select. Caller holds waitq.
  */
+#define DTAPE_WAKE_NOTES 96
+
+static char dtape_wake_notes[DTAPE_WAKE_NOTES][160];
+static uint32_t dtape_wake_count;
+static int dtape_wake_flushed;
+static int dtape_post_handed;
+
+void
+dtape_wake_mark_handed(void)
+{
+	dtape_post_handed = 1;
+}
+
+void
+dtape_wake_clear_handed(void)
+{
+	dtape_post_handed = 0;
+}
+
+int
+dtape_wake_handed(void)
+{
+	return dtape_post_handed;
+}
+
+extern int open(const char *path, int flags, ...);
+extern long write(int fd, const void *buf, unsigned long n);
+extern int close(int fd);
+extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+
+void
+dtape_wake_note(const char *line)
+{
+	int slot;
+
+	if (line == NULL) {
+		return;
+	}
+	slot = dtape_wake_count;
+	if (slot >= DTAPE_WAKE_NOTES) {
+		return;
+	}
+	if (!OSCompareAndSwap(slot, slot + 1, &dtape_wake_count)) {
+		return;
+	}
+	snprintf(dtape_wake_notes[slot], sizeof(dtape_wake_notes[slot]), "%s", line);
+}
+
+void
+dtape_wake_flush(void)
+{
+	int fd;
+	int i;
+
+	if (dtape_wake_flushed >= dtape_wake_count) {
+		return;
+	}
+	fd = open("/tmp/mqpost.log", 0x441, 0644);
+	if (fd < 0) {
+		return;
+	}
+	for (i = dtape_wake_flushed; i < dtape_wake_count && i < DTAPE_WAKE_NOTES; i++) {
+		unsigned long len = 0;
+		while (dtape_wake_notes[i][len] != '\0') {
+			len++;
+		}
+		write(fd, dtape_wake_notes[i], len);
+	}
+	dtape_wake_flushed = i;
+	close(fd);
+}
+
+static inline void waitq_thread_remove(struct waitq *wq, thread_t thread);
+static inline void thread_clear_waitq_state(thread_t thread);
+
+thread_t
+waitq_claim_set_receiver(struct waitq *waitq, spl_t *spl)
+{
+	uint32_t i;
+
+	for (i = 0; i < g_num_waitqs; i++) {
+		struct waitq *safeq = &global_waitqs[i];
+		thread_t thread;
+		spl_t s;
+
+		if (waitq_is_turnstile_queue(safeq)) {
+			continue;
+		}
+		s = splsched();
+		waitq_lock(safeq);
+		qe_foreach_element_safe(thread, &safeq->waitq_queue, wait_links) {
+			if (thread->waitq == waitq &&
+			    thread->wait_event == NO_EVENT64) {
+				kern_return_t __assert_only ret;
+				thread_lock(thread);
+				thread_clear_waitq_state(thread);
+				waitq_thread_remove(safeq, thread);
+				*spl = s;
+				waitq_unlock(safeq);
+				ret = thread_go(thread, THREAD_AWAKENED, WQ_OPTION_NONE);
+				assert(ret == KERN_SUCCESS);
+				return thread;
+			}
+		}
+		waitq_unlock(safeq);
+		splx(s);
+	}
+	{
+		char line[160];
+		uint64_t wanted_id = ((struct waitq_set *)waitq)->wqset_id;
+		int noted = 0;
+		for (i = 0; i < g_num_waitqs; i++) {
+			struct waitq *safeq = &global_waitqs[i];
+			thread_t thread;
+			spl_t s;
+			if (waitq_is_turnstile_queue(safeq)) {
+				continue;
+			}
+			s = splsched();
+			waitq_lock(safeq);
+			qe_foreach_element_safe(thread, &safeq->waitq_queue, wait_links) {
+				struct waitq *wq = thread->waitq;
+				if (thread->wait_event != NO_EVENT64 || !waitq_is_set(wq)) {
+					continue;
+				}
+				if (noted < 4 && dtape_wake_count < 80) {
+					snprintf(line, sizeof(line),
+					    "miss wanted=%p id=%llu waiter=%p id=%llu\n",
+					    (void *)waitq,
+					    (unsigned long long)wanted_id,
+					    (void *)wq,
+					    (unsigned long long)((struct waitq_set *)wq)->wqset_id);
+					dtape_wake_note(line);
+					noted++;
+				}
+				if (((struct waitq_set *)wq)->wqset_id == wanted_id &&
+				    wanted_id != 0) {
+					kern_return_t __assert_only ret;
+					thread_lock(thread);
+					thread_clear_waitq_state(thread);
+					waitq_thread_remove(safeq, thread);
+					*spl = s;
+					waitq_unlock(safeq);
+					ret = thread_go(thread, THREAD_AWAKENED, WQ_OPTION_NONE);
+					assert(ret == KERN_SUCCESS);
+					return thread;
+				}
+			}
+			waitq_unlock(safeq);
+			splx(s);
+		}
+	}
+	return THREAD_NULL;
+}
+
 void
 waitq_hint_set_waiter(struct waitq *waitq)
 {
@@ -2967,6 +3122,13 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 		/* mark the event and real waitq, even if enqueued on a global safeq */
 		thread->wait_event = wait_event;
 		thread->waitq = waitq;
+		if (wait_event == NO_EVENT64 && waitq_is_set(waitq) && dtape_wake_count < 40) {
+			char line[160];
+			snprintf(line, sizeof(line),
+			    "wait q=%p set=%d\n",
+			    (void *)waitq, waitq_is_set(waitq) ? 1 : 0);
+			dtape_wake_note(line);
+		}
 
 		if (deadline != 0) {
 			boolean_t act;

@@ -38,6 +38,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <exception>
+
+extern "C" int dtape_wake_handed(void);
+extern "C" void dtape_wake_note(const char *line);
+extern "C" void dtape_wake_flush(void);
 #include <darlingserver/logging.hpp>
 
 #include <darlingserver/logging.hpp>
@@ -231,6 +235,10 @@ struct DTapeHooks {
 	};
 
 	static void dtape_hook_current_thread_syscall_return(int result_code) {
+		if (dtape_wake_handed()) {
+			dtape_wake_note("syscall_return after handoff\n");
+			dtape_wake_flush();
+		}
 		DarlingServer::Thread::syscallReturn(result_code);
 	};
 

@@ -313,6 +313,10 @@ ipc_pset_wake_member(ipc_port_t port, spl_t *spl, uint64_t *reserved_prepost)
 		    reserved_prepost,
 		    WAITQ_ALL_PRIORITIES,
 		    WAITQ_KEEP_LOCKED);
+		if (receiver == THREAD_NULL) {
+			receiver = waitq_claim_set_receiver(
+			    &pset->ips_messages.imq_wait_queue, spl);
+		}
 		imq_unlock(&pset->ips_messages);
 		if (receiver != THREAD_NULL) {
 			return receiver;

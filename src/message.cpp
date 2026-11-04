@@ -24,6 +24,11 @@
 #include <new>
 #include <mutex>
 #include <system_error>
+#include <cstdio>
+
+extern "C" int dtape_wake_handed(void);
+extern "C" void dtape_wake_note(const char *line);
+extern "C" void dtape_wake_clear_handed(void);
 
 DarlingServer::Address::Address() {
 	_address.sun_family = AF_UNIX;
@@ -531,6 +536,14 @@ bool DarlingServer::MessageQueue::sendMany(int socket) {
 		}
 
 		ret = sendmmsg(socket, mmsgs, len, MSG_DONTWAIT);
+		{
+			if (dtape_wake_handed() && ret > 0) {
+				char line[160];
+				snprintf(line, sizeof(line), "sendmmsg fd=%d n=%d\n", socket, ret);
+				dtape_wake_note(line);
+				dtape_wake_clear_handed();
+			}
+		}
 
 		if (ret < 0) {
 			if (errno == EAGAIN) {
