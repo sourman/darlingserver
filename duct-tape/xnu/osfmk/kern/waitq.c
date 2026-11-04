@@ -2136,10 +2136,18 @@ waitq_select_walk_cb(struct waitq *waitq, void *ctx,
 			/* break out of the setid walk */
 			ret = WQ_ITERATE_FOUND;
 		}
-	} else if (args.event == NO_EVENT64) {
+	} else {
+		/*
+		 * No waiter on this set. A port-set receive only looks at
+		 * preposts, so an IPC wake (IPC_MQUEUE_RECEIVE, not
+		 * NO_EVENT64) that misses the waiter must still prepost.
+		 * Otherwise CFRunLoopWakeUp's message sits on the wake port
+		 * and the run loop blocked in mach_msg on the set never
+		 * returns, so the posted display-link task never runs.
+		 */
 		/*
 		 * No thread selected: prepost 'waitq' to 'wqset'
-		 * if wqset can handle preposts and the event is set to 0.
+		 * if wqset can handle preposts.
 		 * We also make sure to not post waitq sets to other sets.
 		 *
 		 * If the set doesn't support preposts, but does support
