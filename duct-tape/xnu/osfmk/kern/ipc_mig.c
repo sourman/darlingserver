@@ -740,6 +740,10 @@ mach_msg_overwrite(
 			/* hold ref for object */
 
 			self->ith_continuation = (void (*)(mach_msg_return_t))0;
+			if (imq_is_set(mqueue)) {
+				extern void dtape_note_set_wait(thread_t, mach_port_name_t, ipc_mqueue_t);
+				dtape_note_set_wait(self, rcv_name, mqueue);
+			}
 			ipc_mqueue_receive(mqueue,
 			    MACH_MSG_OPTION_NONE,
 			    MACH_MSG_SIZE_MAX,

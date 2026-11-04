@@ -1649,6 +1649,51 @@ wq_prepost_do_post_locked(struct waitq_set *wqset,
 	return;
 }
 
+static int
+waitq_prepost_linked_cb(struct waitq *waitq, void *ctx, struct waitq_link *link)
+{
+	struct waitq_set *wqset;
+	uint64_t *reserved = (uint64_t *)ctx;
+
+	(void)waitq;
+	if (wql_type(link) != WQL_WQS) {
+		return WQ_ITERATE_CONTINUE;
+	}
+	wqset = link->wql_wqs.wql_set;
+	waitq_set_lock(wqset);
+	if (wqset->wqset_id == link->wql_setid.id &&
+	    waitq_set_can_prepost(wqset)) {
+		wq_prepost_do_post_locked(wqset, waitq, reserved);
+	}
+	waitq_set_unlock(wqset);
+	return WQ_ITERATE_CONTINUE;
+}
+
+/*
+ * The message stayed on the member port because no set waiter was selected.
+ * A later receive on each linked set only looks at preposts, so record one.
+ * 'waitq' is locked.
+ */
+void
+waitq_prepost_locked(struct waitq *waitq, struct waitq_set *wqset, uint64_t *reserved)
+{
+	if (waitq == NULL || wqset == NULL || !waitq_set_can_prepost(wqset)) {
+		return;
+	}
+	wq_prepost_do_post_locked(wqset, waitq, reserved);
+}
+
+void
+waitq_prepost_linked_sets(struct waitq *waitq, uint64_t *reserved)
+{
+	if (waitq == NULL || waitq->waitq_set_id == 0) {
+		return;
+	}
+	(void)walk_waitq_links(LINK_WALK_ONE_LEVEL, waitq, waitq->waitq_set_id,
+	    WQL_WQS, reserved, waitq_prepost_linked_cb);
+}
+
+
 
 /* ----------------------------------------------------------------------
  *
@@ -2030,6 +2075,46 @@ waitq_claim_set_receiver(struct waitq *waitq, spl_t *spl)
 			waitq_unlock(safeq);
 			splx(s);
 		}
+	}
+	return THREAD_NULL;
+}
+
+/*
+ * The hashed safeq select can miss a port-set receive that is queued on
+ * another global FIFO. Scan every safeq for this waitq and event.
+ * The thread is locked and already thread_go'd.
+ */
+thread_t
+waitq_claim_waitq_receiver(struct waitq *waitq, event64_t event, spl_t *spl)
+{
+	uint32_t i;
+
+	for (i = 0; i < g_num_waitqs; i++) {
+		struct waitq *safeq = &global_waitqs[i];
+		thread_t thread;
+		spl_t s;
+
+		if (waitq_is_turnstile_queue(safeq)) {
+			continue;
+		}
+		s = splsched();
+		waitq_lock(safeq);
+		qe_foreach_element_safe(thread, &safeq->waitq_queue, wait_links) {
+			if (thread->waitq == waitq &&
+			    thread->wait_event == event) {
+				kern_return_t __assert_only ret;
+				thread_lock(thread);
+				thread_clear_waitq_state(thread);
+				waitq_thread_remove(safeq, thread);
+				*spl = s;
+				waitq_unlock(safeq);
+				ret = thread_go(thread, THREAD_AWAKENED, WQ_OPTION_NONE);
+				assert(ret == KERN_SUCCESS);
+				return thread;
+			}
+		}
+		waitq_unlock(safeq);
+		splx(s);
 	}
 	return THREAD_NULL;
 }

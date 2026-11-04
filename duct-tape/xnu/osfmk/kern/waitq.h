@@ -465,6 +465,9 @@ extern int dtape_wake_handed(void);
  * Caller holds 'waitq'. Returns the thread locked, or THREAD_NULL.
  */
 extern thread_t waitq_claim_set_receiver(struct waitq *waitq, spl_t *spl);
+extern thread_t waitq_claim_waitq_receiver(struct waitq *waitq, event64_t event, spl_t *spl);
+extern void waitq_prepost_locked(struct waitq *waitq, struct waitq_set *wqset, uint64_t *reserved);
+extern void waitq_prepost_linked_sets(struct waitq *waitq, uint64_t *reserved);
 
 
 /* on success, consumes an reserved_link reference */

@@ -281,6 +281,123 @@ ipc_pset_forget_port(ipc_port_t port)
 	}
 }
 
+extern void dtape_wake_log(const char *line);
+
+void
+ipc_pset_log_members(ipc_port_t port, mach_port_name_t name)
+{
+	int i;
+	int slots = 0;
+	char line[160];
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		if (ipc_pset_members[i].port != IP_NULL) {
+			slots++;
+		}
+	}
+	snprintf(line, sizeof(line), "wake members port=%u slots=%d\n",
+	    (unsigned)name, slots);
+	dtape_wake_log(line);
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+		if (ipc_pset_members[i].port != port) {
+			continue;
+		}
+		pset = ipc_pset_members[i].pset;
+		if (pset == IPS_NULL) {
+			continue;
+		}
+		snprintf(line, sizeof(line),
+		    "wake member port=%u setname=%u wqset=%llu\n",
+		    (unsigned)name,
+		    (unsigned)pset->ips_messages.imq_receiver_name,
+		    (unsigned long long)pset->ips_messages.imq_set_queue.wqset_id);
+		dtape_wake_log(line);
+	}
+}
+
+/*
+ * A message queued on a member port is invisible to a port-set receive:
+ * nothing records a prepost, so the set waiter blocks even though the
+ * member queue is non-empty. Hand that queue back to the receive.
+ * The set mqueue is locked. On success the member port mqueue is also locked.
+ */
+ipc_mqueue_t
+ipc_pset_select_member_message(ipc_mqueue_t set_mq)
+{
+	int i;
+	int matched = 0;
+	static int select_logs;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_port_t port;
+		ipc_pset_t pset;
+		ipc_mqueue_t port_mq;
+
+		port = ipc_pset_members[i].port;
+		pset = ipc_pset_members[i].pset;
+		if (port == IP_NULL || pset == IPS_NULL) {
+			continue;
+		}
+		if (&pset->ips_messages != set_mq) {
+			continue;
+		}
+		if (select_logs < 8) {
+			char line[120];
+			snprintf(line, sizeof(line),
+			    "select member port=%u q=%u\n",
+			    (unsigned)port->ip_receiver_name,
+			    (unsigned)port->ip_messages.imq_msgcount);
+			dtape_wake_log(line);
+		}
+		matched++;
+		port_mq = &port->ip_messages;
+		if (!imq_lock_try(port_mq)) {
+			continue;
+		}
+		if (ipc_kmsg_queue_first(&port_mq->imq_messages) != IKM_NULL) {
+			return port_mq;
+		}
+		imq_unlock(port_mq);
+	}
+	if (select_logs < 30 && set_mq->imq_set_queue.wqset_id >= 262159) {
+		char line[120];
+		select_logs++;
+		snprintf(line, sizeof(line),
+		    "select wq=%p wqset=%llu matched=%d\n",
+		    (void *)set_mq,
+		    (unsigned long long)set_mq->imq_set_queue.wqset_id,
+		    matched);
+		dtape_wake_log(line);
+	}
+	return IMQ_NULL;
+}
+
+void
+ipc_pset_prepost_port(ipc_port_t port, uint64_t *reserved)
+{
+	int i;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+		if (ipc_pset_members[i].port != port) {
+			continue;
+		}
+		pset = ipc_pset_members[i].pset;
+		if (pset == IPS_NULL) {
+			continue;
+		}
+		waitq_set_lock(&pset->ips_messages.imq_set_queue);
+		if (waitq_set_can_prepost(&pset->ips_messages.imq_set_queue)) {
+			extern void waitq_prepost_locked(struct waitq *, struct waitq_set *, uint64_t *);
+			waitq_prepost_locked(&port->ip_messages.imq_wait_queue,
+			    &pset->ips_messages.imq_set_queue, reserved);
+		}
+		waitq_set_unlock(&pset->ips_messages.imq_set_queue);
+	}
+}
+
 thread_t
 ipc_pset_wake_member(ipc_port_t port, spl_t *spl, uint64_t *reserved_prepost)
 {
@@ -316,6 +433,11 @@ ipc_pset_wake_member(ipc_port_t port, spl_t *spl, uint64_t *reserved_prepost)
 		if (receiver == THREAD_NULL) {
 			receiver = waitq_claim_set_receiver(
 			    &pset->ips_messages.imq_wait_queue, spl);
+		}
+		if (receiver == THREAD_NULL) {
+			receiver = waitq_claim_waitq_receiver(
+			    &pset->ips_messages.imq_wait_queue,
+			    IPC_MQUEUE_RECEIVE, spl);
 		}
 		imq_unlock(&pset->ips_messages);
 		if (receiver != THREAD_NULL) {

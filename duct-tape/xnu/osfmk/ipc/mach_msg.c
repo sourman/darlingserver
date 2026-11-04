@@ -476,6 +476,10 @@ mach_msg_receive(
 	self->ith_continuation = continuation;
 	self->ith_knote = ITH_KNOTE_NULL;
 
+	if (imq_is_set(mqueue)) {
+		extern void dtape_note_set_wait(thread_t, mach_port_name_t, ipc_mqueue_t);
+		dtape_note_set_wait(self, rcv_name, mqueue);
+	}
 	ipc_mqueue_receive(mqueue, option, rcv_size, rcv_timeout, THREAD_ABORTSAFE);
 	if ((option & MACH_RCV_TIMEOUT) && rcv_timeout == 0) {
 		thread_poll_yield(self);
@@ -601,9 +605,13 @@ mach_msg_overwrite_trap(
 		self->ith_option = option;
 		self->ith_receiver_name = MACH_PORT_NULL;
 		self->ith_continuation = thread_syscall_return;
-		self->ith_knote = ITH_KNOTE_NULL;
+	self->ith_knote = ITH_KNOTE_NULL;
 
-		ipc_mqueue_receive(mqueue, option, rcv_size, msg_timeout, THREAD_ABORTSAFE);
+	if (imq_is_set(mqueue)) {
+		extern void dtape_note_set_wait(thread_t, mach_port_name_t, ipc_mqueue_t);
+		dtape_note_set_wait(self, rcv_name, mqueue);
+	}
+	ipc_mqueue_receive(mqueue, option, rcv_size, msg_timeout, THREAD_ABORTSAFE);
 		if ((option & MACH_RCV_TIMEOUT) && msg_timeout == 0) {
 			thread_poll_yield(self);
 		}
