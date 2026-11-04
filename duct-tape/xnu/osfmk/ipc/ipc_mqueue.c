@@ -565,6 +565,12 @@ ipc_mqueue_handoff_full_to_set(ipc_mqueue_t mqueue)
 	receiver->ith_state = MACH_MSG_SUCCESS;
 	receiver->ith_kmsg = kmsg;
 	receiver->ith_seqno = mqueue->imq_seqno++;
+	{
+		char line[80];
+		snprintf(line, sizeof(line), "wake handoff port=%u\n",
+		    (unsigned)mqueue->imq_receiver_name);
+		dtape_wake_note(line);
+	}
 	thread_unlock(receiver);
 	splx(th_spl);
 	ipc_mqueue_release_msgcount(mqueue, IMQ_NULL);
@@ -990,7 +996,8 @@ out_unlock:
 		char line[160];
 		extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
 		snprintf(line, sizeof(line),
-		    "post set_id=%llu handed=%d queued=%d\n",
+		    "post port=%u set_id=%llu handed=%d queued=%d\n",
+		    (unsigned)mqueue->imq_receiver_name,
 		    (unsigned long long)set_id_log, handed, queued);
 		dtape_wake_note(line);
 		if (handed) {

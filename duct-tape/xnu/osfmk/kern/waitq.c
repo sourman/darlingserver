@@ -1952,6 +1952,7 @@ dtape_wake_flush(void)
 
 static inline void waitq_thread_remove(struct waitq *wq, thread_t thread);
 static inline void thread_clear_waitq_state(thread_t thread);
+extern int waitq_pull_thread_locked(struct waitq *waitq, thread_t thread);
 
 thread_t
 waitq_claim_set_receiver(struct waitq *waitq, spl_t *spl)
@@ -3040,7 +3041,18 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 	assert(!thread->started || thread == current_thread());
 
 	if (thread->waitq != NULL) {
-		panic("thread already waiting on %p", thread->waitq);
+		/*
+		 * A wake left this thread queued. Pull it off and let the new
+		 * wait proceed. Panicking here killed darlingserver under the
+		 * session (core of server 692991).
+		 */
+		struct waitq *oldq = thread->waitq;
+		thread_lock(thread);
+		if (thread->waitq == oldq &&
+		    !waitq_pull_thread_locked(oldq, thread)) {
+			thread_clear_waitq_state(thread);
+		}
+		thread_unlock(thread);
 	}
 
 	if (waitq_is_set(waitq)) {
