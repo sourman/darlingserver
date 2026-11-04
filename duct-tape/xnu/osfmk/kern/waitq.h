@@ -449,6 +449,9 @@ extern boolean_t waitq_member(struct waitq *waitq, struct waitq_set *wqset);
 /* returns true if the waitq is in at least 1 set */
 extern boolean_t waitq_in_set(struct waitq *waitq);
 
+/* Caller holds waitq. Makes a port-set receive visible to waitq_select. */
+extern void waitq_hint_set_waiter(struct waitq *waitq);
+
 
 /* on success, consumes an reserved_link reference */
 extern kern_return_t waitq_link(struct waitq *waitq,

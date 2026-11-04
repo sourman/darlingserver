@@ -224,6 +224,103 @@ ipc_pset_member(
  *		The owner of the port set is also receiver for the port.
  */
 
+#define IPC_PSET_MEMBER_MAX 4096
+
+struct ipc_pset_member {
+	ipc_port_t port;
+	ipc_pset_t pset;
+};
+
+static struct ipc_pset_member ipc_pset_members[IPC_PSET_MEMBER_MAX];
+
+void
+ipc_pset_note_member(ipc_port_t port, ipc_pset_t pset)
+{
+	int i;
+	int free_slot = -1;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		if (ipc_pset_members[i].port == port &&
+		    ipc_pset_members[i].pset == pset) {
+			return;
+		}
+		if (free_slot < 0 && ipc_pset_members[i].port == IP_NULL) {
+			free_slot = i;
+		}
+	}
+	if (free_slot >= 0) {
+		ipc_pset_members[free_slot].port = port;
+		ipc_pset_members[free_slot].pset = pset;
+	}
+}
+
+void
+ipc_pset_forget_member(ipc_port_t port, ipc_pset_t pset)
+{
+	int i;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		if (ipc_pset_members[i].port == port &&
+		    ipc_pset_members[i].pset == pset) {
+			ipc_pset_members[i].port = IP_NULL;
+			ipc_pset_members[i].pset = IPS_NULL;
+		}
+	}
+}
+
+void
+ipc_pset_forget_port(ipc_port_t port)
+{
+	int i;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		if (ipc_pset_members[i].port == port) {
+			ipc_pset_members[i].port = IP_NULL;
+			ipc_pset_members[i].pset = IPS_NULL;
+		}
+	}
+}
+
+thread_t
+ipc_pset_wake_member(ipc_port_t port, spl_t *spl, uint64_t *reserved_prepost)
+{
+	int i;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+		thread_t receiver;
+
+		if (ipc_pset_members[i].port != port) {
+			continue;
+		}
+		pset = ipc_pset_members[i].pset;
+		if (pset == IPS_NULL) {
+			continue;
+		}
+		/*
+		 * The member's waitq_set_id is 0, so a wakeup on the port
+		 * never walks this set. The run loop is waiting on the set.
+		 */
+		imq_lock(&pset->ips_messages);
+		port->ip_messages.imq_wait_queue.waitq_set_id =
+		    pset->ips_messages.imq_set_queue.wqset_id;
+		waitq_hint_set_waiter(&pset->ips_messages.imq_wait_queue);
+		receiver = waitq_wakeup64_identify_locked(
+		    &pset->ips_messages.imq_wait_queue,
+		    IPC_MQUEUE_RECEIVE,
+		    THREAD_AWAKENED,
+		    spl,
+		    reserved_prepost,
+		    WAITQ_ALL_PRIORITIES,
+		    WAITQ_KEEP_LOCKED);
+		imq_unlock(&pset->ips_messages);
+		if (receiver != THREAD_NULL) {
+			return receiver;
+		}
+	}
+	return THREAD_NULL;
+}
+
 kern_return_t
 ipc_pset_add(
 	ipc_pset_t        pset,
@@ -238,6 +335,9 @@ ipc_pset_add(
 
 	kr = ipc_mqueue_add(&port->ip_messages, &pset->ips_messages,
 	    reserved_link, reserved_prepost);
+	if (kr == KERN_SUCCESS || kr == KERN_ALREADY_IN_SET) {
+		ipc_pset_note_member(port, pset);
+	}
 
 #if DSERVER_EXTENDED_DEBUG
 	if (kr == KERN_SUCCESS) {
@@ -273,6 +373,9 @@ ipc_pset_remove(
 	}
 
 	kr = ipc_mqueue_remove(&port->ip_messages, &pset->ips_messages);
+	if (kr == KERN_SUCCESS) {
+		ipc_pset_forget_member(port, pset);
+	}
 
 #if DSERVER_EXTENDED_DEBUG
 	if (kr == KERN_SUCCESS) {
@@ -345,6 +448,7 @@ kern_return_t
 ipc_pset_remove_from_all(
 	ipc_port_t      port)
 {
+	ipc_pset_forget_port(port);
 	if (port->ip_in_pset == 0) {
 		return KERN_NOT_IN_SET;
 	}

@@ -786,6 +786,22 @@ ipc_mqueue_post(
 		    WAITQ_KEEP_LOCKED);
 		/* waitq still locked, thread locked */
 
+		/*
+		 * CFRunLoopWakeUp sends to the wake port. That port's
+		 * waitq_set_id is 0, so the walk above never reaches the
+		 * mode port set the run loop is receiving on. Wake that
+		 * set from the membership mach_port_insert_member recorded.
+		 */
+		if (receiver == THREAD_NULL) {
+			ipc_object_t object = imq_to_object(mqueue);
+			if (io_otype(object) == IOT_PORT) {
+				receiver = ipc_pset_wake_member(
+				    ip_object_to_port(object),
+				    &th_spl,
+				    &reserved_prepost);
+			}
+		}
+
 		if (receiver == THREAD_NULL) {
 			/*
 			 * no receivers; queue kmsg if space still reserved

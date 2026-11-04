@@ -419,6 +419,16 @@ wql_get_link(uint64_t setid)
 	struct lt_elem *elem;
 
 	elem = ltable_get_elem(&g_wqlinktable, setid);
+	if (elem == NULL) {
+		/*
+		 * mach_port_insert_member stores this id and returns
+		 * KERN_SUCCESS. A later lookup misses (valid bit clear)
+		 * and used to zero waitq_set_id, so a port-set receive
+		 * never saw CFRunLoopWakeUp. Keep the element if this
+		 * index still holds this id.
+		 */
+		elem = ltable_get_elem_mark_valid(&g_wqlinktable, setid);
+	}
 	return (struct waitq_link *)elem;
 }
 
@@ -1862,6 +1872,31 @@ waitq_get_safeq(struct waitq *waitq)
 	return global_eventq(waitq);
 }
 
+/*
+ * Port-set receive threads sit on the global FIFO event queue. That
+ * queue's eventmask is a hint: a clear bit makes waitq_select skip the
+ * queue, so a send to a member never wakes the run loop. Set the bit
+ * for this set before the select. Caller holds waitq.
+ */
+void
+waitq_hint_set_waiter(struct waitq *waitq)
+{
+	struct waitq *safeq;
+
+	if (waitq_irq_safe(waitq) || !waitq_is_set(waitq)) {
+		return;
+	}
+	safeq = waitq_get_safeq(waitq);
+	if (safeq == NULL || safeq == waitq) {
+		return;
+	}
+	/*
+	 * Single-threaded server. Do not lock safeq here: the caller already
+	 * holds the port and the set, and safeq's lock is not recursive.
+	 */
+	safeq->waitq_eventmask |= _CAST_TO_EVENT_MASK(waitq);
+}
+
 static uint32_t
 waitq_hash_size(void)
 {
@@ -2523,8 +2558,11 @@ handle_waitq_set:
 	/* check to see if the set ID for this wait queue is valid */
 	struct waitq_link *link = wql_get_link(waitq->waitq_set_id);
 	if (!link) {
-		/* the waitq set to which this waitq belonged, has been invalidated */
-		waitq->waitq_set_id = 0;
+		/*
+		 * Leave waitq_set_id alone. Zeroing it drops a membership
+		 * mach_port_insert_member already committed, and the port
+		 * set receive then never sees CFRunLoopWakeUp.
+		 */
 		return;
 	}
 
@@ -2774,8 +2812,7 @@ handle_waitq_set:
 	/* check to see if the set ID for this wait queue is valid */
 	link = wql_get_link(waitq->waitq_set_id);
 	if (!link) {
-		/* the waitq to which this set belonged, has been invalidated */
-		waitq->waitq_set_id = 0;
+		/* Keep waitq_set_id. See do_waitq_select_n_locked. */
 		return KERN_NOT_WAITING;
 	}
 
@@ -4059,9 +4096,6 @@ waitq_in_set(struct waitq *waitq)
 		/* if we get here, the waitq is in _at_least_one_ set */
 		inset = TRUE;
 		wql_put_link(link);
-	} else {
-		/* we can just optimize this for next time */
-		waitq->waitq_set_id = 0;
 	}
 
 out_unlock:

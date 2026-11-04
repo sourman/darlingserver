@@ -802,6 +802,31 @@ ltable_get_elem(struct link_table *table, uint64_t id)
 	return elem;
 }
 
+struct lt_elem *
+ltable_get_elem_mark_valid(struct link_table *table, uint64_t setid)
+{
+	struct ltable_id id;
+	struct lt_elem *elem;
+	uint32_t bits;
+
+	id.id = setid;
+	if (setid == 0 || id.idx >= table->nelem) {
+		return NULL;
+	}
+	elem = lt_elem_idx(table, id.idx);
+	if (elem->lt_id.id != setid) {
+		return NULL;
+	}
+	bits = elem->lt_bits;
+	if (lt_bits_type(bits) == LT_FREE || lt_bits_type(bits) == LT_RESERVED) {
+		return NULL;
+	}
+	if (!lt_bits_valid(bits)) {
+		lt_elem_mkvalid(elem);
+	}
+	return ltable_get_elem(table, setid);
+}
+
 /**
  * ltable_put_elem: release a reference to table element
  *
