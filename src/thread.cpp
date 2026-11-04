@@ -1260,7 +1260,13 @@ uintptr_t DarlingServer::Thread::allocatePages(size_t pageCount, int protection,
 	} else if (fixed) {
 		flags |= MAP_FIXED_NOREPLACE;
 	}
-	auto result = _mmap(addressHint, pageCount * sysconf(_SC_PAGESIZE), protection, flags, -1, 0, err);
+	uintptr_t result = (uintptr_t)MAP_FAILED;
+	// sigexc interrupts the guest mmap. EINTR means nothing was mapped.
+	for (int attempt = 0; attempt < 64; attempt++) {
+		result = _mmap(addressHint, pageCount * sysconf(_SC_PAGESIZE), protection, flags, -1, 0, err);
+		if (result != (uintptr_t)MAP_FAILED || err != EINTR)
+			break;
+	}
 	if (result == (uintptr_t)MAP_FAILED) {
 		throw std::system_error(err, std::generic_category(), "S2C mmap call failed");
 	}
@@ -1282,7 +1288,13 @@ uintptr_t DarlingServer::Thread::mapFile(int fd, size_t pageCount, int protectio
 	} else if (fixed) {
 		flags |= MAP_FIXED_NOREPLACE;
 	}
-	auto result = _mmap(addressHint, pageCount * sysconf(_SC_PAGESIZE), protection, flags, fd, pageOffset * sysconf(_SC_PAGESIZE), err);
+	uintptr_t result = (uintptr_t)MAP_FAILED;
+	// sigexc interrupts the guest mmap. EINTR means nothing was mapped.
+	for (int attempt = 0; attempt < 64; attempt++) {
+		result = _mmap(addressHint, pageCount * sysconf(_SC_PAGESIZE), protection, flags, fd, pageOffset * sysconf(_SC_PAGESIZE), err);
+		if (result != (uintptr_t)MAP_FAILED || err != EINTR)
+			break;
+	}
 	if (result == (uintptr_t)MAP_FAILED) {
 		throw std::system_error(err, std::generic_category(), "S2C mmap call failed");
 	}

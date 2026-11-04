@@ -568,7 +568,7 @@ kern_return_t task_policy_get(task_t task, task_policy_flavor_t flavor, task_pol
 };
 
 void task_policy_get_deallocate(task_policy_get_t task_policy_get) {
-	dtape_stub_unsafe();
+	task_deallocate((task_t)task_policy_get);
 };
 
 kern_return_t task_policy_set(task_t task, task_policy_flavor_t flavor, task_policy_t policy_info, mach_msg_type_number_t count) {
