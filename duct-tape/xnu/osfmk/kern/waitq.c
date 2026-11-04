@@ -1681,6 +1681,10 @@ waitq_prepost_locked(struct waitq *waitq, struct waitq_set *wqset, uint64_t *res
 		return;
 	}
 	wq_prepost_do_post_locked(wqset, waitq, reserved);
+	{
+		extern void dtape_note_prepost(struct waitq *, struct waitq_set *);
+		dtape_note_prepost(waitq, wqset);
+	}
 }
 
 void
@@ -3133,9 +3137,19 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 		 */
 		struct waitq *oldq = thread->waitq;
 		thread_lock(thread);
-		if (thread->waitq == oldq &&
-		    !waitq_pull_thread_locked(oldq, thread)) {
-			thread_clear_waitq_state(thread);
+		if (thread->waitq == oldq) {
+			/*
+			 * assert_wait is entered with this waitq already
+			 * locked. waitq_lock_try panics when the caller
+			 * owns that lock, so pull under the held lock
+			 * instead of taking it again.
+			 */
+			if (oldq == waitq && waitq_irq_safe(waitq)) {
+				waitq_thread_remove(waitq, thread);
+				thread_clear_waitq_state(thread);
+			} else if (!waitq_pull_thread_locked(oldq, thread)) {
+				thread_clear_waitq_state(thread);
+			}
 		}
 		thread_unlock(thread);
 	}

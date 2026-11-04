@@ -815,6 +815,150 @@ static struct dtape_set_wait dtape_set_waits[48];
 static int dtape_set_wait_n;
 static int dtape_wake_log_n;
 
+struct dtape_prepost_slot {
+	uint64_t wqset;
+	ipc_port_t port;
+	uint64_t prepost_id;
+};
+static struct dtape_prepost_slot dtape_preposts[64];
+static int dtape_id_log_n;
+
+extern int open(const char *path, int flags, ...);
+extern long write(int fd, const void *buf, unsigned long n);
+extern int close(int fd);
+
+static void
+dtape_id_log(const char *line)
+{
+	int fd;
+	unsigned long len = 0;
+
+	if (line == NULL || dtape_id_log_n >= 400) {
+		return;
+	}
+	dtape_id_log_n++;
+	while (line[len] != '\0') {
+		len++;
+	}
+	fd = open("/tmp/mqid.log", 0x441, 0644);
+	if (fd < 0) {
+		return;
+	}
+	write(fd, line, len);
+	close(fd);
+}
+
+void
+dtape_note_prepost(struct waitq *port_wq, struct waitq_set *wqset)
+{
+	ipc_mqueue_t mq;
+	ipc_object_t object;
+	ipc_port_t port;
+	int i;
+	char line[160];
+
+	if (port_wq == NULL || wqset == NULL || wqset->wqset_id == 0) {
+		return;
+	}
+	mq = (ipc_mqueue_t)port_wq;
+	object = imq_to_object(mq);
+	if (io_otype(object) != IOT_PORT) {
+		return;
+	}
+	port = ip_object_to_port(object);
+	for (i = 0; i < 64; i++) {
+		if (dtape_preposts[i].port == port &&
+		    dtape_preposts[i].wqset == wqset->wqset_id) {
+			break;
+		}
+		if (dtape_preposts[i].port == IP_NULL) {
+			break;
+		}
+	}
+	if (i == 64) {
+		i = 0;
+	}
+	dtape_preposts[i].port = port;
+	dtape_preposts[i].wqset = wqset->wqset_id;
+	dtape_preposts[i].prepost_id = wqset->wqset_prepost_id;
+	if (wqset->wqset_id >= 262155) {
+		snprintf(line, sizeof(line),
+		    "prepost port=%u wqset=%llu prepost_id=%llu\n",
+		    (unsigned)port->ip_receiver_name,
+		    (unsigned long long)wqset->wqset_id,
+		    (unsigned long long)wqset->wqset_prepost_id);
+		dtape_id_log(line);
+	}
+}
+
+static ipc_mqueue_t
+dtape_take_prepost(ipc_mqueue_t set_mq, thread_t thread)
+{
+	uint64_t wqset;
+	uint64_t prepost_id;
+	mach_port_name_t name = 0;
+	int i;
+	char line[180];
+
+	if (!imq_is_set(set_mq)) {
+		return IMQ_NULL;
+	}
+	wqset = set_mq->imq_set_queue.wqset_id;
+	prepost_id = set_mq->imq_set_queue.wqset_prepost_id;
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		if (dtape_set_waits[i].thread == thread) {
+			name = dtape_set_waits[i].name;
+			break;
+		}
+	}
+	if (thread->thread_id < 75) {
+		return IMQ_NULL;
+	}
+	snprintf(line, sizeof(line),
+	    "recv tid=%llu name=%u wqset=%llu prepost_id=%llu\n",
+	    (unsigned long long)thread->thread_id,
+	    (unsigned)name,
+	    (unsigned long long)wqset,
+	    (unsigned long long)prepost_id);
+	dtape_id_log(line);
+	for (i = 0; i < 64; i++) {
+		ipc_port_t port = dtape_preposts[i].port;
+		ipc_mqueue_t port_mq;
+
+		if (port == IP_NULL || dtape_preposts[i].wqset != wqset) {
+			continue;
+		}
+		port_mq = &port->ip_messages;
+		if (!imq_lock_try(port_mq)) {
+			continue;
+		}
+		if (ipc_kmsg_queue_first(&port_mq->imq_messages) == IKM_NULL) {
+			imq_unlock(port_mq);
+			continue;
+		}
+		{
+			uint64_t slot_prepost = dtape_preposts[i].prepost_id;
+
+			dtape_preposts[i].port = IP_NULL;
+			dtape_preposts[i].wqset = 0;
+			dtape_preposts[i].prepost_id = 0;
+			if (slot_prepost != 0 &&
+			    set_mq->imq_set_queue.wqset_prepost_id == slot_prepost) {
+				set_mq->imq_set_queue.wqset_prepost_id = 0;
+			}
+		}
+		snprintf(line, sizeof(line),
+		    "take tid=%llu name=%u wqset=%llu port=%u\n",
+		    (unsigned long long)thread->thread_id,
+		    (unsigned)name,
+		    (unsigned long long)wqset,
+		    (unsigned)port->ip_receiver_name);
+		dtape_id_log(line);
+		return port_mq;
+	}
+	return IMQ_NULL;
+}
+
 extern int open(const char *path, int flags, ...);
 extern long write(int fd, const void *buf, unsigned long n);
 extern int close(int fd);
@@ -974,22 +1118,6 @@ ipc_mqueue_post(
 			 */
 			if (mqueue->imq_msgcount > 0) {
 				queued = 1;
-				/*
-				 * No waiter took the message. Leave it queued and
-				 * prepost every set this port belongs to, so the
-				 * next receive on that set returns it.
-				 */
-				waitq_prepost_linked_sets(&mqueue->imq_wait_queue,
-				    &reserved_prepost);
-				{
-					ipc_object_t prepost_object = imq_to_object(mqueue);
-					extern void ipc_pset_prepost_port(ipc_port_t, uint64_t *);
-					if (io_otype(prepost_object) == IOT_PORT) {
-						ipc_pset_prepost_port(
-						    ip_object_to_port(prepost_object),
-						    &reserved_prepost);
-					}
-				}
 				if (ipc_kmsg_enqueue_qos(&mqueue->imq_messages, kmsg)) {
 					/* if the space is dead there is no point calling KNOTE */
 					ipc_object_t object = imq_to_object(mqueue);
@@ -1000,6 +1128,22 @@ ipc_mqueue_post(
 					    is_active(port->ip_receiver) &&
 					    ipc_mqueue_has_klist(mqueue)) {
 						KNOTE(&mqueue->imq_klist, 0);
+					}
+				}
+				/*
+				 * The kmsg is on the queue now. Prepost every set
+				 * this port belongs to so the next receive on that
+				 * set returns it instead of an empty prepost.
+				 */
+				waitq_prepost_linked_sets(&mqueue->imq_wait_queue,
+				    &reserved_prepost);
+				{
+					ipc_object_t prepost_object = imq_to_object(mqueue);
+					extern void ipc_pset_prepost_port(ipc_port_t, uint64_t *);
+					if (io_otype(prepost_object) == IOT_PORT) {
+						ipc_pset_prepost_port(
+						    ip_object_to_port(prepost_object),
+						    &reserved_prepost);
 					}
 				}
 				break;
@@ -1342,10 +1486,12 @@ ipc_mqueue_receive_on_thread(
 	if (imq_is_set(mqueue)) {
 		ipc_mqueue_t port_mq = IMQ_NULL;
 
-		(void)waitq_set_iterate_preposts(&mqueue->imq_set_queue,
-		    &port_mq,
-		    mqueue_process_prepost_receive);
-
+		port_mq = dtape_take_prepost(mqueue, thread);
+		if (port_mq == IMQ_NULL) {
+			(void)waitq_set_iterate_preposts(&mqueue->imq_set_queue,
+			    &port_mq,
+			    mqueue_process_prepost_receive);
+		}
 		if (port_mq == IMQ_NULL) {
 			extern ipc_mqueue_t ipc_pset_select_member_message(ipc_mqueue_t);
 			port_mq = ipc_pset_select_member_message(mqueue);
