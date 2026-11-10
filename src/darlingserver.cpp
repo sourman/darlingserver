@@ -34,6 +34,7 @@
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <iostream>
+#include <exception>
 #include <linux/sched.h>
 #include <sys/syscall.h>
 #include <sys/signal.h>
@@ -803,9 +804,26 @@ int main(int argc, char** argv) {
 	close(childWaitFDs[1]);
 
 	// start the main loop
-	server->start();
+	try {
+		server->start();
+	} catch (const std::exception& e) {
+		int fd = open("/tmp/ds-main.err", O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd >= 0) {
+			write(fd, e.what(), strlen(e.what()));
+			write(fd, "\n", 1);
+			close(fd);
+		}
+	}
 
 	// this should never happen
+	{
+		int fd = open("/tmp/ds-main.err", O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd >= 0) {
+			const char* line = "Server exited main loop\n";
+			write(fd, line, 23);
+			close(fd);
+		}
+	}
 	std::cerr << "Server exited main loop!" << std::endl;
 	delete server;
 

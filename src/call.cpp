@@ -134,10 +134,10 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			std::unique_lock lock(thread->_rwlock);
 
 			if (thread->_s2cReply) {
-				throw std::runtime_error("Received S2C reply but thread already had one pending");
+				thread->_s2cReplyQueue.push(std::move(requestMessage));
+			} else {
+				thread->_s2cReply = std::move(requestMessage);
 			}
-
-			thread->_s2cReply = std::move(requestMessage);
 		}
 
 		dtape_semaphore_up(thread->_s2cReplySempahore);
@@ -231,7 +231,11 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 	#undef CALL_CASE
 
 	if (thread) {
-		thread->setPendingCall(result);
+		// A queued call stays behind the one that already owns the reply port.
+		// Scheduling it now would resume a suspended thread and free that stack.
+		if (thread->setPendingCall(result) == Thread::SetPendingCallResult::Queued) {
+			return nullptr;
+		}
 		return result;
 	} else {
 		Thread::kernelAsync([result]() {

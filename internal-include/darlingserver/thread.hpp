@@ -93,6 +93,7 @@ namespace DarlingServer {
 		dtape_semaphore_t* _s2cPerformSempahore = nullptr;
 		dtape_semaphore_t* _s2cReplySempahore = nullptr;
 		std::optional<Message> _s2cReply = std::nullopt;
+		std::queue<Message> _s2cReplyQueue;
 		std::condition_variable_any _runningCondvar;
 		DeferralState _deferralState = DeferralState::NotDeferred;
 		uint32_t _bsdReturnValue = 0;
@@ -114,6 +115,7 @@ namespace DarlingServer {
 		};
 		std::stack<InterruptContext> _interrupts;
 		std::queue<std::shared_ptr<Call>> _pendingInterrupts;
+		std::queue<std::shared_ptr<Call>> _queuedCalls;
 		std::optional<Message> _pendingSavedReply = std::nullopt;
 		bool _dead = false;
 		std::shared_ptr<Thread> _selfReference = nullptr;
@@ -167,7 +169,13 @@ namespace DarlingServer {
 		std::shared_ptr<Process> process() const;
 
 		std::shared_ptr<Call> pendingCall() const;
-		void setPendingCall(std::shared_ptr<Call> newPendingCall);
+		enum class SetPendingCallResult {
+			BecamePending,
+			SavedInterrupt,
+			Queued,
+		};
+
+		SetPendingCallResult setPendingCall(std::shared_ptr<Call> newPendingCall);
 
 		std::shared_ptr<Call> activeCall() const;
 		void makePendingCallActive();

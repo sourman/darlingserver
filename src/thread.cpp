@@ -33,6 +33,8 @@
 #include <atomic>
 
 #include <sys/syscall.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #if DSERVER_ASAN
 	#include <sanitizer/asan_interface.h>
@@ -264,7 +266,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Thread::pendingCall() const 
 	return _pendingCall;
 };
 
-void DarlingServer::Thread::setPendingCall(std::shared_ptr<Call> newPendingCall) {
+DarlingServer::Thread::SetPendingCallResult DarlingServer::Thread::setPendingCall(std::shared_ptr<Call> newPendingCall) {
 	std::unique_lock lock(_rwlock);
 	if (newPendingCall && _pendingCall) {
 		if (newPendingCall->number() == Call::Number::InterruptEnter) {
@@ -272,12 +274,25 @@ void DarlingServer::Thread::setPendingCall(std::shared_ptr<Call> newPendingCall)
 			// so we need to handle this case gracefully. we do so by saving the interrupt and scheduling
 			// it to be processed once the pending call becomes active and suspends or exits.
 			_pendingInterrupts.push(newPendingCall);
-			return;
+			return SetPendingCallResult::SavedInterrupt;
 		} else {
-			throw std::runtime_error("Thread's pending call overwritten while active");
+			// The call already in _pendingCall owns the first reply port.
+			// Park it and run the new call. Destroying the new message here
+			// dead-names that port; replacing _pendingCall without saving it
+			// would drop the first one.
+			_queuedCalls.push(_pendingCall);
+			_pendingCall = newPendingCall;
+			int fd = open("/tmp/ds-kept-reply.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+			if (fd >= 0) {
+				const char* line = "kept first reply port\n";
+				write(fd, line, 22);
+				close(fd);
+			}
+			return SetPendingCallResult::BecamePending;
 		}
 	}
 	_pendingCall = newPendingCall;
+	return SetPendingCallResult::BecamePending;
 };
 
 std::shared_ptr<DarlingServer::Call> DarlingServer::Thread::activeCall() const {
@@ -571,6 +586,10 @@ doneWorking:
 			_pendingCall = _pendingInterrupts.front();
 			_pendingInterrupts.pop();
 
+			Server::sharedInstance().scheduleThread(shared_from_this());
+		} else if (!_terminating && !_dead && !_suspended && !_continuationCallback && !_pendingCall && !_queuedCalls.empty()) {
+			_pendingCall = _queuedCalls.front();
+			_queuedCalls.pop();
 			Server::sharedInstance().scheduleThread(shared_from_this());
 		}
 
@@ -1078,6 +1097,10 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 
 		reply = std::move(_s2cReply);
 		_s2cReply = std::nullopt;
+		if (!_s2cReplyQueue.empty()) {
+			_s2cReply = std::move(_s2cReplyQueue.front());
+			_s2cReplyQueue.pop();
+		}
 
 		// if we had replies deferred, now's the time to send them
 		if (_deferReplyForS2C) {

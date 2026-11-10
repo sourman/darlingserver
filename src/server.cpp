@@ -713,7 +713,17 @@ std::string DarlingServer::Server::prefix() const {
 };
 
 void DarlingServer::Server::_worker(std::shared_ptr<Thread> thread) {
-	thread->doWork();
+	try {
+		thread->doWork();
+	} catch (const std::exception& e) {
+		int fd = open("/tmp/ds-worker.err", O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd >= 0) {
+			const char* what = e.what();
+			write(fd, what, strlen(what));
+			write(fd, "\n", 1);
+			close(fd);
+		}
+	}
 };
 
 void DarlingServer::Server::scheduleThread(std::shared_ptr<Thread> thread) {
