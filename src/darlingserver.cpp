@@ -732,6 +732,25 @@ int main(int argc, char** argv) {
 			}
 		}
 
+		// /dev and zoneinfo in the prefix are symlinks to /Volumes/SystemRoot.
+		// Bind the host root there so those resolve after chroot.
+		{
+			char sysroot[4096];
+			char devpath[4096];
+			snprintf(sysroot, sizeof(sysroot), "%s/Volumes/SystemRoot", prefix);
+			mkdir(sysroot, 0755);
+			if (mount("/", sysroot, "", MS_BIND, "") != 0) {
+				fprintf(stderr, "Cannot bind / onto %s: %s\n", sysroot, strerror(errno));
+				exit(1);
+			}
+			snprintf(devpath, sizeof(devpath), "%s/dev", sysroot);
+			mkdir(devpath, 0755);
+			if (mount("/dev", devpath, "", MS_BIND, "") != 0) {
+				fprintf(stderr, "Cannot bind /dev onto %s: %s\n", devpath, strerror(errno));
+				exit(1);
+			}
+		}
+
 		// launchd's root is the prefix, not the host /.
 		if (chroot(prefix) != 0) {
 			fprintf(stderr, "Cannot chroot into prefix %s: %s\n", prefix, strerror(errno));
