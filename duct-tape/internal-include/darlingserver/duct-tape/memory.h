@@ -63,6 +63,8 @@ struct vm_map_copy {
 #define VM_MAP_COPY_ENTRY_LIST 1
 #define VM_MAP_COPY_OBJECT 2
 #define VM_MAP_COPY_KERNEL_BUFFER 3
+/* Darling: cpy_kdata is a dtape_map_shared_descriptor_t*. */
+#define VM_MAP_COPY_MEMFD 4
 
 void dtape_memory_init(void);
 vm_map_t dtape_vm_map_create(struct dtape_task* task);

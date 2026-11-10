@@ -145,6 +145,15 @@ std::string DarlingServer::Process::vchrootPath() const {
 	return _cachedVchrootPath;
 };
 
+static std::string gLaunchdPrefix;
+
+void DarlingServer::Process::setLaunchdPrefix(std::string prefix) {
+	while (prefix.size() > 1 && prefix.back() == '/') {
+		prefix.pop_back();
+	}
+	gLaunchdPrefix = std::move(prefix);
+}
+
 void DarlingServer::Process::setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor) {
 	std::unique_lock lock(_rwlock);
 	_vchrootDescriptor = directoryDescriptor;
@@ -161,6 +170,11 @@ void DarlingServer::Process::setVchrootDirectory(std::shared_ptr<FD> directoryDe
 	tmp[len] = '\0';
 
 	_cachedVchrootPath = std::string(tmp);
+	// launchd is chrooted into this prefix. Report "/" so path expansion
+	// stays inside that root instead of prepending the host prefix again.
+	if (!gLaunchdPrefix.empty() && _cachedVchrootPath == gLaunchdPrefix) {
+		_cachedVchrootPath = "/";
+	}
 	delete[] tmp;
 };
 
@@ -369,7 +383,17 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	} else {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
-			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			// Parent exec replacement drops this semaphore while holding
+			// _rwlock, then creates a new one. Death clears it from a
+			// microthread. Signaling a null semaphore kills darlingserver.
+			dtape_semaphore_t* semaphore = nullptr;
+			{
+				std::shared_lock parentLock(parent->_rwlock);
+				semaphore = parent->_dtapeForkWaitSemaphore;
+			}
+			if (semaphore) {
+				dtape_semaphore_up(semaphore);
+			}
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
 		}
 	}

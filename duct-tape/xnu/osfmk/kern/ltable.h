@@ -232,6 +232,13 @@ extern void ltable_realloc_elem(struct link_table *table,
  */
 extern struct lt_elem *ltable_get_elem(struct link_table *table, uint64_t id);
 
+/*
+ * Like ltable_get_elem, but if the element at this id's index still has
+ * this id and is not free, mark it valid and return a reference.
+ */
+extern struct lt_elem *ltable_get_elem_mark_valid(struct link_table *table,
+    uint64_t id);
+
 
 /**
  * ltable_put_elem: release a reference to table element

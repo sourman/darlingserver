@@ -224,6 +224,299 @@ ipc_pset_member(
  *		The owner of the port set is also receiver for the port.
  */
 
+#define IPC_PSET_MEMBER_MAX 32768
+
+struct ipc_pset_member {
+	ipc_port_t port;
+	ipc_pset_t pset;
+};
+
+static struct ipc_pset_member ipc_pset_members[IPC_PSET_MEMBER_MAX];
+
+void
+ipc_pset_note_member(ipc_port_t port, ipc_pset_t pset)
+{
+	int i;
+	int free_slot = -1;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		if (ipc_pset_members[i].port == port &&
+		    ipc_pset_members[i].pset == pset) {
+			return;
+		}
+		if (free_slot < 0 && ipc_pset_members[i].port == IP_NULL) {
+			free_slot = i;
+		}
+	}
+	if (free_slot < 0) {
+		for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+			ipc_port_t old = ipc_pset_members[i].port;
+			if (old != IP_NULL && !ip_active(old)) {
+				free_slot = i;
+				break;
+			}
+		}
+	}
+	if (free_slot < 0) {
+		return;
+	}
+	ipc_pset_members[free_slot].port = port;
+	ipc_pset_members[free_slot].pset = pset;
+}
+
+void
+ipc_pset_forget_member(ipc_port_t port, ipc_pset_t pset)
+{
+	int i;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		if (ipc_pset_members[i].port == port &&
+		    ipc_pset_members[i].pset == pset) {
+			ipc_pset_members[i].port = IP_NULL;
+			ipc_pset_members[i].pset = IPS_NULL;
+		}
+	}
+}
+
+void
+ipc_pset_forget_port(ipc_port_t port)
+{
+	int i;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		if (ipc_pset_members[i].port == port) {
+			ipc_pset_members[i].port = IP_NULL;
+			ipc_pset_members[i].pset = IPS_NULL;
+		}
+	}
+}
+
+extern void dtape_wake_log(const char *line);
+
+void
+ipc_pset_log_members(ipc_port_t port, mach_port_name_t name)
+{
+	int i;
+	int slots = 0;
+	char line[160];
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		if (ipc_pset_members[i].port != IP_NULL) {
+			slots++;
+		}
+	}
+	snprintf(line, sizeof(line), "wake members port=%u slots=%d\n",
+	    (unsigned)name, slots);
+	dtape_wake_log(line);
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+		if (ipc_pset_members[i].port != port) {
+			continue;
+		}
+		pset = ipc_pset_members[i].pset;
+		if (pset == IPS_NULL) {
+			continue;
+		}
+		snprintf(line, sizeof(line),
+		    "wake member port=%u setname=%u wqset=%llu\n",
+		    (unsigned)name,
+		    (unsigned)pset->ips_messages.imq_receiver_name,
+		    (unsigned long long)pset->ips_messages.imq_set_queue.wqset_id);
+		dtape_wake_log(line);
+	}
+}
+
+/*
+ * A message queued on a member port is invisible to a port-set receive:
+ * nothing records a prepost, so the set waiter blocks even though the
+ * member queue is non-empty. Hand that queue back to the receive.
+ * The set mqueue is locked. On success the member port mqueue is also locked.
+ */
+ipc_mqueue_t
+ipc_pset_select_member_message(ipc_mqueue_t set_mq)
+{
+	int i;
+	int matched = 0;
+	static int select_logs;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_port_t port;
+		ipc_pset_t pset;
+		ipc_mqueue_t port_mq;
+
+		port = ipc_pset_members[i].port;
+		pset = ipc_pset_members[i].pset;
+		if (port == IP_NULL || pset == IPS_NULL) {
+			continue;
+		}
+		if (&pset->ips_messages != set_mq) {
+			continue;
+		}
+		if (select_logs < 8) {
+			char line[120];
+			snprintf(line, sizeof(line),
+			    "select member port=%u q=%u\n",
+			    (unsigned)port->ip_receiver_name,
+			    (unsigned)port->ip_messages.imq_msgcount);
+			dtape_wake_log(line);
+		}
+		matched++;
+		port_mq = &port->ip_messages;
+		if (!imq_lock_try(port_mq)) {
+			continue;
+		}
+		if (ipc_kmsg_queue_first(&port_mq->imq_messages) != IKM_NULL) {
+			return port_mq;
+		}
+		imq_unlock(port_mq);
+	}
+	if (select_logs < 30 && set_mq->imq_set_queue.wqset_id >= 262159) {
+		char line[120];
+		select_logs++;
+		snprintf(line, sizeof(line),
+		    "select wq=%p wqset=%llu matched=%d\n",
+		    (void *)set_mq,
+		    (unsigned long long)set_mq->imq_set_queue.wqset_id,
+		    matched);
+		dtape_wake_log(line);
+	}
+	return IMQ_NULL;
+}
+
+void
+ipc_pset_prepost_port(ipc_port_t port, uint64_t *reserved)
+{
+	int i;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+		if (ipc_pset_members[i].port != port) {
+			continue;
+		}
+		pset = ipc_pset_members[i].pset;
+		if (pset == IPS_NULL) {
+			continue;
+		}
+		waitq_set_lock(&pset->ips_messages.imq_set_queue);
+		if (waitq_set_can_prepost(&pset->ips_messages.imq_set_queue)) {
+			extern void waitq_prepost_locked(struct waitq *, struct waitq_set *, uint64_t *);
+			waitq_prepost_locked(&port->ip_messages.imq_wait_queue,
+			    &pset->ips_messages.imq_set_queue, reserved);
+		}
+		waitq_set_unlock(&pset->ips_messages.imq_set_queue);
+	}
+}
+
+int
+ipc_pset_member_names(ipc_mqueue_t set_mq, mach_port_name_t *names, int max)
+{
+	int i;
+	int n = 0;
+
+	if (set_mq == IMQ_NULL) {
+		return 0;
+	}
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+		ipc_port_t port;
+
+		port = ipc_pset_members[i].port;
+		pset = ipc_pset_members[i].pset;
+		if (port == IP_NULL || pset == IPS_NULL) {
+			continue;
+		}
+		if (&pset->ips_messages != set_mq) {
+			continue;
+		}
+		if (names != NULL && n < max) {
+			names[n] = port->ip_receiver_name;
+		}
+		n++;
+	}
+	return n;
+}
+
+int
+ipc_pset_waiting_set(ipc_port_t port, struct waitq *set_wq)
+{
+	int i;
+
+	if (port == IP_NULL || set_wq == NULL) {
+		return 0;
+	}
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+
+		if (ipc_pset_members[i].port != port) {
+			continue;
+		}
+		pset = ipc_pset_members[i].pset;
+		if (pset == IPS_NULL) {
+			continue;
+		}
+		if (&pset->ips_messages.imq_wait_queue == set_wq) {
+			return 1;
+		}
+		if (waitq_is_set(set_wq) &&
+		    ((struct waitq_set *)set_wq)->wqset_id ==
+		    pset->ips_messages.imq_set_queue.wqset_id &&
+		    pset->ips_messages.imq_set_queue.wqset_id != 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+thread_t
+ipc_pset_wake_member(ipc_port_t port, spl_t *spl, uint64_t *reserved_prepost)
+{
+	int i;
+
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+		thread_t receiver;
+
+		if (ipc_pset_members[i].port != port) {
+			continue;
+		}
+		pset = ipc_pset_members[i].pset;
+		if (pset == IPS_NULL) {
+			continue;
+		}
+		/*
+		 * The member's waitq_set_id is 0, so a wakeup on the port
+		 * never walks this set. The run loop is waiting on the set.
+		 */
+		imq_lock(&pset->ips_messages);
+		port->ip_messages.imq_wait_queue.waitq_set_id =
+		    pset->ips_messages.imq_set_queue.wqset_id;
+		waitq_hint_set_waiter(&pset->ips_messages.imq_wait_queue);
+		receiver = waitq_wakeup64_identify_locked(
+		    &pset->ips_messages.imq_wait_queue,
+		    IPC_MQUEUE_RECEIVE,
+		    THREAD_AWAKENED,
+		    spl,
+		    reserved_prepost,
+		    WAITQ_ALL_PRIORITIES,
+		    WAITQ_KEEP_LOCKED);
+		if (receiver == THREAD_NULL) {
+			receiver = waitq_claim_set_receiver(
+			    &pset->ips_messages.imq_wait_queue, spl);
+		}
+		if (receiver == THREAD_NULL) {
+			receiver = waitq_claim_waitq_receiver(
+			    &pset->ips_messages.imq_wait_queue,
+			    IPC_MQUEUE_RECEIVE, spl);
+		}
+		imq_unlock(&pset->ips_messages);
+		if (receiver != THREAD_NULL) {
+			return receiver;
+		}
+	}
+	return THREAD_NULL;
+}
+
 kern_return_t
 ipc_pset_add(
 	ipc_pset_t        pset,
@@ -238,6 +531,9 @@ ipc_pset_add(
 
 	kr = ipc_mqueue_add(&port->ip_messages, &pset->ips_messages,
 	    reserved_link, reserved_prepost);
+	if (kr == KERN_SUCCESS || kr == KERN_ALREADY_IN_SET) {
+		ipc_pset_note_member(port, pset);
+	}
 
 #if DSERVER_EXTENDED_DEBUG
 	if (kr == KERN_SUCCESS) {
@@ -273,6 +569,9 @@ ipc_pset_remove(
 	}
 
 	kr = ipc_mqueue_remove(&port->ip_messages, &pset->ips_messages);
+	if (kr == KERN_SUCCESS) {
+		ipc_pset_forget_member(port, pset);
+	}
 
 #if DSERVER_EXTENDED_DEBUG
 	if (kr == KERN_SUCCESS) {
@@ -345,6 +644,7 @@ kern_return_t
 ipc_pset_remove_from_all(
 	ipc_port_t      port)
 {
+	ipc_pset_forget_port(port);
 	if (port->ip_in_pset == 0) {
 		return KERN_NOT_IN_SET;
 	}

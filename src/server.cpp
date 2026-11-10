@@ -37,6 +37,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <exception>
+
+extern "C" int dtape_wake_handed(void);
+extern "C" void dtape_wake_note(const char *line);
+extern "C" void dtape_wake_flush(void);
+#include <darlingserver/logging.hpp>
 
 #include <darlingserver/logging.hpp>
 
@@ -105,7 +111,18 @@ struct DTapeHooks {
 		std::unique_lock lock(server._timerLock);
 
 		if (!override && server._currentTimerDeadline != 0 && deadline_ns >= server._currentTimerDeadline) {
-			return;
+			struct itimerspec armed;
+			memset(&armed, 0, sizeof(armed));
+			/*
+			 * A one-shot timerfd reads as disarmed after it fires,
+			 * while _currentTimerDeadline still names that past
+			 * deadline. Skipping then leaves the new wait with no
+			 * timer. Program it unless the fd is still armed.
+			 */
+			if (timerfd_gettime(server._timerFD, &armed) == 0 &&
+			    (armed.it_value.tv_sec != 0 || armed.it_value.tv_nsec != 0)) {
+				return;
+			}
 		}
 
 		server._currentTimerDeadline = deadline_ns;
@@ -229,6 +246,10 @@ struct DTapeHooks {
 	};
 
 	static void dtape_hook_current_thread_syscall_return(int result_code) {
+		if (dtape_wake_handed()) {
+			dtape_wake_note("syscall_return after handoff\n");
+			dtape_wake_flush();
+		}
 		DarlingServer::Thread::syscallReturn(result_code);
 	};
 
@@ -326,6 +347,11 @@ struct DTapeHooks {
 		try {
 			return static_cast<DarlingServer::Process*>(task_context)->mapFile(fd, page_count, protection, address_hint, page_offset, flags & dtape_memory_flag_fixed, flags & dtape_memory_flag_overwrite);
 		} catch (std::system_error e) {
+			static DarlingServer::Log mapFileLog("mapfile");
+			mapFileLog.error() << "task_map_file failed: " << e.what() << " errno=" << e.code().value()
+				<< " fd=" << fd << " pages=" << page_count << " prot=" << protection
+				<< " hint=" << address_hint << " page_off=" << page_offset << " flags=" << (int)flags
+				<< mapFileLog.endLog;
 			return 0;
 		}
 	};
@@ -521,6 +547,8 @@ DarlingServer::Server::~Server() {
 	unlink(_socketPath.c_str());
 };
 
+static DarlingServer::Log serverLog("server");
+
 void DarlingServer::Server::start() {
 	Thread::interruptDisable();
 	dtape_init(&DTapeHooks::dtape_hooks);
@@ -538,9 +566,13 @@ void DarlingServer::Server::start() {
 
 			while (auto msg = _inbox.pop()) {
 				// TODO: this could be done concurrently
-				auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
-				if (call) {
-					_workQueue.push(call->thread());
+				try {
+					auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
+					if (call) {
+						_workQueue.push(call->thread());
+					}
+				} catch (const std::exception& e) {
+					serverLog.error() << "Dropping a call that threw: " << e.what() << serverLog.endLog;
 				}
 			}
 		}
@@ -681,7 +713,14 @@ std::string DarlingServer::Server::prefix() const {
 };
 
 void DarlingServer::Server::_worker(std::shared_ptr<Thread> thread) {
-	thread->doWork();
+	try {
+		thread->doWork();
+	} catch (const std::exception& e) {
+		const char* what = e.what();
+		write(STDERR_FILENO, "ds-worker ", 10);
+		write(STDERR_FILENO, what, strlen(what));
+		write(STDERR_FILENO, "\n", 1);
+	}
 };
 
 void DarlingServer::Server::scheduleThread(std::shared_ptr<Thread> thread) {

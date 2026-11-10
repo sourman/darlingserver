@@ -34,6 +34,7 @@
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <iostream>
+#include <exception>
 #include <linux/sched.h>
 #include <sys/syscall.h>
 #include <sys/signal.h>
@@ -43,6 +44,7 @@
 
 #include <darlingserver/server.hpp>
 #include <darlingserver/config.hpp>
+#include <darlingserver/process.hpp>
 
 #ifndef DARLINGSERVER_INIT_PROCESS
 	#define DARLINGSERVER_INIT_PROCESS "/sbin/launchd"
@@ -266,9 +268,12 @@ void spawnLaunchd(const char* prefix)
 		initPath = DARLINGSERVER_INIT_PROCESS;
 	}
 
-	setenv("__mldr_DYLD_ROOT_PATH", LIBEXEC_PATH, 1);
-	setenv("__mldr_sockpath", tmp.c_str(), 1);
-	execl(DarlingServer::Config::defaultMldrPath.data(), "mldr!" LIBEXEC_PATH "/usr/libexec/darling/vchroot", "vchroot", prefix, initPath, NULL);
+	// The clone child has chrooted into the prefix. Paths below are inside that root.
+	(void)prefix;
+	(void)tmp;
+	setenv("__mldr_DYLD_ROOT_PATH", "/", 1);
+	setenv("__mldr_sockpath", "/.darlingserver.sock", 1);
+	execl("/usr/libexec/darling/mldr", "mldr!/usr/libexec/darling/vchroot", "vchroot", "/", initPath, NULL);
 
 	fprintf(stderr, "Failed to exec launchd: %s\n", strerror(errno));
 	abort();
@@ -537,6 +542,7 @@ int main(int argc, char** argv) {
 	}
 
 	prefix_length = strlen(prefix);
+	DarlingServer::Process::setLaunchdPrefix(prefix);
 
 	if (getuid() != 0 || getgid() != 0) {
 		fprintf(stderr, "darlingserver needs to start as root\n");
@@ -710,6 +716,52 @@ int main(int argc, char** argv) {
 			exit(1);
 		}
 
+		// mldr is a host ELF. Bind the host loader and libc in so exec works after chroot.
+		{
+			char libpath[4096];
+			snprintf(libpath, sizeof(libpath), "%s/lib", prefix);
+			mkdir(libpath, 0755);
+			if (mount("/usr/lib", libpath, "", MS_BIND, "") != 0) {
+				fprintf(stderr, "Cannot bind /usr/lib into prefix: %s\n", strerror(errno));
+				exit(1);
+			}
+			snprintf(libpath, sizeof(libpath), "%s/lib64", prefix);
+			mkdir(libpath, 0755);
+			if (mount("/usr/lib64", libpath, "", MS_BIND, "") != 0) {
+				fprintf(stderr, "Cannot bind /usr/lib64 into prefix: %s\n", strerror(errno));
+				exit(1);
+			}
+		}
+
+		// /dev and zoneinfo in the prefix are symlinks to /Volumes/SystemRoot.
+		// Bind the host root there so those resolve after chroot.
+		{
+			char sysroot[4096];
+			char devpath[4096];
+			snprintf(sysroot, sizeof(sysroot), "%s/Volumes/SystemRoot", prefix);
+			mkdir(sysroot, 0755);
+			if (mount("/", sysroot, "", MS_BIND, "") != 0) {
+				fprintf(stderr, "Cannot bind / onto %s: %s\n", sysroot, strerror(errno));
+				exit(1);
+			}
+			snprintf(devpath, sizeof(devpath), "%s/dev", sysroot);
+			mkdir(devpath, 0755);
+			if (mount("/dev", devpath, "", MS_BIND, "") != 0) {
+				fprintf(stderr, "Cannot bind /dev onto %s: %s\n", devpath, strerror(errno));
+				exit(1);
+			}
+		}
+
+		// launchd's root is the prefix, not the host /.
+		if (chroot(prefix) != 0) {
+			fprintf(stderr, "Cannot chroot into prefix %s: %s\n", prefix, strerror(errno));
+			exit(1);
+		}
+		if (chdir("/") != 0) {
+			fprintf(stderr, "Cannot chdir to prefix root: %s\n", strerror(errno));
+			exit(1);
+		}
+
 		// drop our privileges now
 		perma_drop_privileges(originalUID, originalGID);
 		prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
@@ -744,6 +796,11 @@ int main(int argc, char** argv) {
 	sigaction(SIGUSR1, &leak_info_action, NULL);
 #endif
 
+	// The shell is the session leader. When it exits, the kernel sends
+	// SIGHUP to this process, the listen socket disappears, and clients
+	// see ECONNREFUSED (-111) from interrupt_enter.
+	signal(SIGHUP, SIG_IGN);
+
 	// create the server
 	auto server = new DarlingServer::Server(prefix);
 
@@ -752,9 +809,24 @@ int main(int argc, char** argv) {
 	close(childWaitFDs[1]);
 
 	// start the main loop
-	server->start();
+	try {
+		server->start();
+	} catch (const std::exception& e) {
+		const char* what = e.what();
+		write(STDERR_FILENO, "ds-main ", 8);
+		write(STDERR_FILENO, what, strlen(what));
+		write(STDERR_FILENO, "\n", 1);
+	}
 
 	// this should never happen
+	{
+		int fd = open("/tmp/ds-main.err", O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd >= 0) {
+			const char* line = "Server exited main loop\n";
+			write(fd, line, 23);
+			close(fd);
+		}
+	}
 	std::cerr << "Server exited main loop!" << std::endl;
 	delete server;
 

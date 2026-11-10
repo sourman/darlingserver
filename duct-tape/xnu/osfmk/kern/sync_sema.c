@@ -631,9 +631,16 @@ semaphore_convert_wait_result(int wait_result)
 	case THREAD_RESTART:
 		return KERN_TERMINATED;
 
+	/*
+	 * Darling's thread_block can resume a semaphore waiter while
+	 * wait_result is still THREAD_WAITING (-1). Panicking here takes
+	 * down every process in the container. Hand the waiter an abort
+	 * so the caller can fail the operation and the server stays up.
+	 */
+	case THREAD_WAITING:
+	case THREAD_NOT_WAITING:
 	default:
-		panic("semaphore_block\n");
-		return KERN_FAILURE;
+		return KERN_ABORTED;
 	}
 }
 

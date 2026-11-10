@@ -783,6 +783,26 @@ again:
 		tid_th = THREAD_NULL;
 	}
 	assert(old_owner == THREAD_NULL);
+
+	/*
+	 * Userspace may have dropped the exclusive bit after this waiter
+	 * decided to sleep (unlock saw no kernel waiters and cleared it
+	 * without a wakeup). The lock is free; return it instead of
+	 * blocking until a signal that will not come. Aligned LP64
+	 * pthread_mutex_t stores m_seq at byte 0x20.
+	 */
+	{
+		uint32_t live_lgen = 0;
+
+		if (copyin(mutex + 0x20, &live_lgen, sizeof(live_lgen)) == 0 &&
+				(live_lgen & PTH_RWL_EBIT) == 0) {
+			updatebits = (live_lgen & PTHRW_COUNT_MASK) |
+					(PTH_RWL_KBIT | PTH_RWL_EBIT);
+			ksyn_wqunlock(kwq);
+			*retval = updatebits;
+			goto out;
+		}
+	}
 	error = ksyn_wait(kwq, KSYN_QUEUE_WRITE, mgen, ins_flags, 0, 0,
 			psynch_mtxcontinue, kThreadWaitPThreadMutex);
 	// ksyn_wait drops wait queue lock

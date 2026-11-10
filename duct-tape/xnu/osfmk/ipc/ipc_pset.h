@@ -73,6 +73,7 @@
 #include <ipc/ipc_types.h>
 #include <ipc/ipc_object.h>
 #include <ipc/ipc_mqueue.h>
+#include <kern/spl.h>
 
 struct ipc_pset {
 	/*
@@ -113,6 +114,19 @@ extern kern_return_t ipc_pset_alloc_name(
 /* Allocate a port set in a special space */
 extern ipc_pset_t ipc_pset_alloc_special(
 	ipc_space_t             space);
+
+/*
+ * mach_port_insert_member links the port into the set, but a later
+ * waitq walk that cannot resolve the link clears waitq_set_id. Remember
+ * the pair so a send to the member can still wake the set.
+ */
+extern void ipc_pset_note_member(ipc_port_t port, ipc_pset_t pset);
+extern void ipc_pset_forget_member(ipc_port_t port, ipc_pset_t pset);
+extern void ipc_pset_forget_port(ipc_port_t port);
+extern int ipc_pset_waiting_set(ipc_port_t port, struct waitq *set_wq);
+extern int ipc_pset_member_names(ipc_mqueue_t set_mq, mach_port_name_t *names, int max);
+extern thread_t ipc_pset_wake_member(ipc_port_t port, spl_t *spl,
+    uint64_t *reserved_prepost);
 
 /* Add a port to a port set */
 extern kern_return_t ipc_pset_add(

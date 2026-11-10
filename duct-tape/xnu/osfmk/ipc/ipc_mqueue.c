@@ -520,6 +520,62 @@ ipc_mqueue_changed(
  *		MACH_SEND_TIMED_OUT	Caller still has message.
  *		MACH_SEND_INTERRUPTED	Caller still has message.
  */
+/*
+ * CFRunLoopWakeUp sends with MACH_SEND_TIMEOUT and a timeout of 0.
+ * Once one message sits on the wake port, the next send stops here:
+ * the queue is full, so we return MACH_SEND_TIMED_OUT and never call
+ * ipc_mqueue_post. The run loop is blocked in a set receive, which
+ * only sees preposts, so its recvmsg socket is never written.
+ * Hand the queued message to that set waiter.
+ *
+ * mqueue is locked.
+ */
+static void
+ipc_mqueue_handoff_full_to_set(ipc_mqueue_t mqueue)
+{
+	ipc_object_t object;
+	ipc_kmsg_t kmsg;
+	thread_t receiver;
+	spl_t th_spl;
+	uint64_t reserved_prepost = 0;
+
+	if (imq_is_set(mqueue) || ipc_kmsg_queue_empty(&mqueue->imq_messages)) {
+		return;
+	}
+	object = imq_to_object(mqueue);
+	if (io_otype(object) != IOT_PORT) {
+		return;
+	}
+	receiver = ipc_pset_wake_member(ip_object_to_port(object),
+	    &th_spl, &reserved_prepost);
+	if (receiver == THREAD_NULL) {
+		return;
+	}
+	if (receiver->ith_state != MACH_RCV_IN_PROGRESS) {
+		thread_unlock(receiver);
+		splx(th_spl);
+		return;
+	}
+	kmsg = ipc_kmsg_dequeue(&mqueue->imq_messages);
+	if (kmsg == IKM_NULL) {
+		thread_unlock(receiver);
+		splx(th_spl);
+		return;
+	}
+	receiver->ith_state = MACH_MSG_SUCCESS;
+	receiver->ith_kmsg = kmsg;
+	receiver->ith_seqno = mqueue->imq_seqno++;
+	{
+		char line[80];
+		snprintf(line, sizeof(line), "wake handoff port=%u\n",
+		    (unsigned)mqueue->imq_receiver_name);
+		dtape_wake_note(line);
+	}
+	thread_unlock(receiver);
+	splx(th_spl);
+	ipc_mqueue_release_msgcount(mqueue, IMQ_NULL);
+}
+
 mach_msg_return_t
 ipc_mqueue_send(
 	ipc_mqueue_t            mqueue,
@@ -553,6 +609,7 @@ ipc_mqueue_send(
 		 * We have to wait for space to be granted to us.
 		 */
 		if ((option & MACH_SEND_TIMEOUT) && (send_timeout == 0)) {
+			ipc_mqueue_handoff_full_to_set(mqueue);
 			imq_unlock(mqueue);
 			return MACH_SEND_TIMED_OUT;
 		}
@@ -746,6 +803,390 @@ ipc_mqueue_release_msgcount(ipc_mqueue_t port_mq, ipc_mqueue_t set_mq)
  *		mqueue is unlocked
  *		If we need to queue, our space in the message queue is reserved.
  */
+struct dtape_set_wait {
+	uint64_t tid;
+	thread_t thread;
+	mach_port_name_t name;
+	uint64_t wqset;
+	struct waitq *waitq;
+	mach_port_name_t members[8];
+	int nmembers;
+	int blocking;
+};
+
+static struct dtape_set_wait dtape_set_waits[48];
+static int dtape_set_wait_n;
+static int dtape_wake_log_n;
+
+struct dtape_prepost_slot {
+	uint64_t wqset;
+	ipc_port_t port;
+	uint64_t prepost_id;
+};
+static struct dtape_prepost_slot dtape_preposts[64];
+static int dtape_id_log_n;
+
+extern int open(const char *path, int flags, ...);
+extern long write(int fd, const void *buf, unsigned long n);
+extern int close(int fd);
+
+static void
+dtape_id_log(const char *line)
+{
+	int fd;
+	unsigned long len = 0;
+
+	if (line == NULL || dtape_id_log_n >= 400) {
+		return;
+	}
+	dtape_id_log_n++;
+	while (line[len] != '\0') {
+		len++;
+	}
+	fd = open("/tmp/mqid.log", 0x441, 0644);
+	if (fd < 0) {
+		return;
+	}
+	write(fd, line, len);
+	close(fd);
+}
+
+void
+dtape_note_prepost(struct waitq *port_wq, struct waitq_set *wqset)
+{
+	ipc_mqueue_t mq;
+	ipc_object_t object;
+	ipc_port_t port;
+	int i;
+	char line[160];
+
+	if (port_wq == NULL || wqset == NULL || wqset->wqset_id == 0) {
+		return;
+	}
+	mq = (ipc_mqueue_t)port_wq;
+	object = imq_to_object(mq);
+	if (io_otype(object) != IOT_PORT) {
+		return;
+	}
+	port = ip_object_to_port(object);
+	for (i = 0; i < 64; i++) {
+		if (dtape_preposts[i].port == port &&
+		    dtape_preposts[i].wqset == wqset->wqset_id) {
+			break;
+		}
+		if (dtape_preposts[i].port == IP_NULL) {
+			break;
+		}
+	}
+	if (i == 64) {
+		i = 0;
+	}
+	dtape_preposts[i].port = port;
+	dtape_preposts[i].wqset = wqset->wqset_id;
+	dtape_preposts[i].prepost_id = wqset->wqset_prepost_id;
+	if (wqset->wqset_id >= 262155) {
+		snprintf(line, sizeof(line),
+		    "prepost port=%u wqset=%llu prepost_id=%llu\n",
+		    (unsigned)port->ip_receiver_name,
+		    (unsigned long long)wqset->wqset_id,
+		    (unsigned long long)wqset->wqset_prepost_id);
+		dtape_id_log(line);
+	}
+}
+
+static ipc_mqueue_t
+dtape_take_prepost(ipc_mqueue_t set_mq, thread_t thread)
+{
+	uint64_t wqset;
+	uint64_t prepost_id;
+	mach_port_name_t name = 0;
+	int i;
+	char line[180];
+
+	if (!imq_is_set(set_mq)) {
+		return IMQ_NULL;
+	}
+	wqset = set_mq->imq_set_queue.wqset_id;
+	prepost_id = set_mq->imq_set_queue.wqset_prepost_id;
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		if (dtape_set_waits[i].thread == thread) {
+			name = dtape_set_waits[i].name;
+			break;
+		}
+	}
+	if (thread->thread_id < 75) {
+		return IMQ_NULL;
+	}
+	snprintf(line, sizeof(line),
+	    "recv tid=%llu name=%u wqset=%llu prepost_id=%llu\n",
+	    (unsigned long long)thread->thread_id,
+	    (unsigned)name,
+	    (unsigned long long)wqset,
+	    (unsigned long long)prepost_id);
+	dtape_id_log(line);
+	for (i = 0; i < 64; i++) {
+		ipc_port_t port = dtape_preposts[i].port;
+		ipc_mqueue_t port_mq;
+
+		if (port == IP_NULL || dtape_preposts[i].wqset != wqset) {
+			continue;
+		}
+		port_mq = &port->ip_messages;
+		if (!imq_lock_try(port_mq)) {
+			continue;
+		}
+		if (ipc_kmsg_queue_first(&port_mq->imq_messages) == IKM_NULL) {
+			imq_unlock(port_mq);
+			continue;
+		}
+		{
+			uint64_t slot_prepost = dtape_preposts[i].prepost_id;
+
+			dtape_preposts[i].port = IP_NULL;
+			dtape_preposts[i].wqset = 0;
+			dtape_preposts[i].prepost_id = 0;
+			if (slot_prepost != 0 &&
+			    set_mq->imq_set_queue.wqset_prepost_id == slot_prepost) {
+				set_mq->imq_set_queue.wqset_prepost_id = 0;
+			}
+		}
+		snprintf(line, sizeof(line),
+		    "take tid=%llu name=%u wqset=%llu port=%u\n",
+		    (unsigned long long)thread->thread_id,
+		    (unsigned)name,
+		    (unsigned long long)wqset,
+		    (unsigned)port->ip_receiver_name);
+		dtape_id_log(line);
+		return port_mq;
+	}
+	return IMQ_NULL;
+}
+
+extern int open(const char *path, int flags, ...);
+extern long write(int fd, const void *buf, unsigned long n);
+extern int close(int fd);
+
+void
+dtape_wake_log(const char *line)
+{
+	int fd;
+	unsigned long len = 0;
+
+	if (line == NULL || dtape_wake_log_n >= 400) {
+		return;
+	}
+	dtape_wake_log_n++;
+	while (line[len] != '\0') {
+		len++;
+	}
+	fd = open("/tmp/mqwake.log", 0x441, 0644);
+	if (fd < 0) {
+		return;
+	}
+	write(fd, line, len);
+	close(fd);
+}
+
+int
+dtape_thread_waits_high_set(thread_t thread)
+{
+	int i;
+
+	if (thread == THREAD_NULL) {
+		return 0;
+	}
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		if (dtape_set_waits[i].thread == thread &&
+		    dtape_set_waits[i].wqset >= 262158) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void
+dtape_note_set_wait(thread_t thread, mach_port_name_t name, ipc_mqueue_t mqueue)
+{
+	int i;
+
+	if (thread == THREAD_NULL || mqueue == IMQ_NULL) {
+		return;
+	}
+	if (!imq_is_set(mqueue) && thread->thread_id < 75) {
+		return;
+	}
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		if (dtape_set_waits[i].thread == thread) {
+			break;
+		}
+	}
+	if (i == dtape_set_wait_n) {
+		if (dtape_set_wait_n >= 48) {
+			i = 0;
+		} else {
+			dtape_set_wait_n++;
+		}
+	}
+	dtape_set_waits[i].tid = thread->thread_id;
+	dtape_set_waits[i].thread = thread;
+	if (name != 0) {
+		dtape_set_waits[i].name = name;
+	}
+	dtape_set_waits[i].wqset = imq_is_set(mqueue) ?
+	    mqueue->imq_set_queue.wqset_id : 0;
+	dtape_set_waits[i].waitq = &mqueue->imq_wait_queue;
+}
+
+/*
+ * The send path searches recorded set members, not the safeq the
+ * port-local wakeup walks. Capture the blocked thread and the member
+ * names here, after the receive has decided to sleep on the set.
+ */
+static void dtape_viz_log(const char *line);
+
+static void
+dtape_record_blocked_set(thread_t thread, ipc_mqueue_t mqueue)
+{
+	int i;
+	extern int ipc_pset_member_names(ipc_mqueue_t set_mq,
+	    mach_port_name_t *names, int max);
+
+	if (thread == THREAD_NULL || mqueue == IMQ_NULL || !imq_is_set(mqueue)) {
+		return;
+	}
+	dtape_note_set_wait(thread, 0, mqueue);
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		if (dtape_set_waits[i].thread != thread) {
+			continue;
+		}
+		dtape_set_waits[i].nmembers = ipc_pset_member_names(mqueue,
+		    dtape_set_waits[i].members, 8);
+		dtape_set_waits[i].blocking = 1;
+		if (dtape_set_waits[i].wqset >= 262158) {
+			char line[180];
+			snprintf(line, sizeof(line),
+			    "viz block tid=%llu set=%u wqset=%llu members=%d m0=%u\n",
+			    (unsigned long long)thread->thread_id,
+			    (unsigned)dtape_set_waits[i].name,
+			    (unsigned long long)dtape_set_waits[i].wqset,
+			    dtape_set_waits[i].nmembers,
+			    (unsigned)dtape_set_waits[i].members[0]);
+			dtape_viz_log(line);
+		}
+		return;
+	}
+}
+
+static int dtape_viz_log_n;
+
+static void
+dtape_viz_log(const char *line)
+{
+	int fd;
+	unsigned long len = 0;
+
+	if (line == NULL || dtape_viz_log_n >= 200) {
+		return;
+	}
+	dtape_viz_log_n++;
+	while (line[len] != '\0') {
+		len++;
+	}
+	fd = open("/tmp/mqviz.log", 0x441, 0644);
+	if (fd < 0) {
+		return;
+	}
+	write(fd, line, len);
+	close(fd);
+}
+
+/*
+ * A CFRunLoop wake queued on a member port does not complete the set
+ * receive when the safeq walk misses that waiter. The waiter is the
+ * thread that blocked on the set. Pull it by pointer and hand it the
+ * message.
+ */
+static thread_t
+dtape_claim_member_waiter(ipc_port_t port, spl_t *spl)
+{
+	int i;
+	extern int ipc_pset_waiting_set(ipc_port_t port, struct waitq *set_wq);
+	extern thread_t waitq_claim_thread(thread_t target, spl_t *spl);
+
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		thread_t thread = dtape_set_waits[i].thread;
+		thread_t got;
+		char line[180];
+		int member;
+
+		if (thread == THREAD_NULL || !dtape_set_waits[i].blocking) {
+			continue;
+		}
+		if (dtape_set_waits[i].wqset < 262158) {
+			continue;
+		}
+		if (thread->ith_state != MACH_RCV_IN_PROGRESS) {
+			continue;
+		}
+		member = 0;
+		{
+			int m;
+			for (m = 0; m < dtape_set_waits[i].nmembers && m < 8; m++) {
+				if (dtape_set_waits[i].members[m] == port->ip_receiver_name &&
+				    port->ip_receiver_name != MACH_PORT_NULL) {
+					member = 1;
+					break;
+				}
+			}
+		}
+		if (!member) {
+			member = ipc_pset_waiting_set(port, dtape_set_waits[i].waitq) ||
+			    ipc_pset_waiting_set(port, thread->waitq);
+		}
+		if (!member) {
+			continue;
+		}
+		snprintf(line, sizeof(line),
+		    "viz port=%u member=%d wqset=%llu tid=%llu name=%u\n",
+		    (unsigned)port->ip_receiver_name, member,
+		    (unsigned long long)dtape_set_waits[i].wqset,
+		    (unsigned long long)thread->thread_id,
+		    (unsigned)dtape_set_waits[i].name);
+		dtape_viz_log(line);
+		got = waitq_claim_thread(thread, spl);
+		snprintf(line, sizeof(line), "viz claim port=%u got=%d state=%d\n",
+		    (unsigned)port->ip_receiver_name, got != THREAD_NULL,
+		    thread->state);
+		dtape_viz_log(line);
+		if (got != THREAD_NULL) {
+			return got;
+		}
+	}
+	return THREAD_NULL;
+}
+
+static void
+dtape_log_set_waits(mach_port_name_t posted)
+{
+	int i;
+	char line[160];
+
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		thread_t thread = dtape_set_waits[i].thread;
+		int live = thread != THREAD_NULL &&
+		    thread->waitq == dtape_set_waits[i].waitq;
+		snprintf(line, sizeof(line),
+		    "wake post port=%u waiter tid=%llu waited=%u wqset=%llu wq=%p live=%d\n",
+		    (unsigned)posted,
+		    (unsigned long long)dtape_set_waits[i].tid,
+		    (unsigned)dtape_set_waits[i].name,
+		    (unsigned long long)dtape_set_waits[i].wqset,
+		    (void *)dtape_set_waits[i].waitq,
+		    live);
+		dtape_wake_log(line);
+	}
+}
+
 void
 ipc_mqueue_post(
 	ipc_mqueue_t               mqueue,
@@ -754,6 +1195,10 @@ ipc_mqueue_post(
 {
 	uint64_t reserved_prepost = 0;
 	boolean_t destroy_msg = FALSE;
+	int handed = 0;
+	int queued = 0;
+	uint64_t handed_tid = 0;
+	uint64_t set_id_log = 0;
 
 	ipc_kmsg_trace_send(kmsg, option);
 
@@ -764,6 +1209,7 @@ ipc_mqueue_post(
 	 *	Check for a receiver for the message.
 	 */
 	imq_reserve_and_lock(mqueue, &reserved_prepost);
+	set_id_log = mqueue->imq_wait_queue.waitq_set_id;
 
 	/* we may have raced with port destruction! */
 	if (!imq_valid(mqueue)) {
@@ -777,6 +1223,23 @@ ipc_mqueue_post(
 		thread_t receiver;
 		mach_msg_size_t msize;
 
+		/*
+		 * CFRunLoopWakeUp sends to the wake port. A thread blocked
+		 * on that port itself is not the run loop. The run loop is
+		 * the thread recorded when the set receive blocked. Hand
+		 * the message to that thread before the port-local walk.
+		 */
+		receiver = THREAD_NULL;
+		{
+			ipc_object_t object = imq_to_object(mqueue);
+			if (!imq_is_set(mqueue) && io_otype(object) == IOT_PORT) {
+				receiver = dtape_claim_member_waiter(
+				    ip_object_to_port(object),
+				    &th_spl);
+			}
+		}
+
+		if (receiver == THREAD_NULL) {
 		receiver = waitq_wakeup64_identify_locked(waitq,
 		    IPC_MQUEUE_RECEIVE,
 		    THREAD_AWAKENED,
@@ -785,6 +1248,32 @@ ipc_mqueue_post(
 		    WAITQ_ALL_PRIORITIES,
 		    WAITQ_KEEP_LOCKED);
 		/* waitq still locked, thread locked */
+
+		/*
+		 * CFRunLoopWakeUp sends to the wake port. That port's
+		 * waitq_set_id is 0, so the walk above never reaches the
+		 * mode port set the run loop is receiving on. Wake that
+		 * set from the membership mach_port_insert_member recorded.
+		 */
+		if (receiver == THREAD_NULL) {
+			ipc_object_t object = imq_to_object(mqueue);
+			if (io_otype(object) == IOT_PORT) {
+				receiver = ipc_pset_wake_member(
+				    ip_object_to_port(object),
+				    &th_spl,
+				    &reserved_prepost);
+			}
+		}
+
+		if (receiver == THREAD_NULL) {
+			ipc_object_t wake_object = imq_to_object(mqueue);
+			if (io_otype(wake_object) == IOT_PORT) {
+				receiver = dtape_claim_member_waiter(
+				    ip_object_to_port(wake_object),
+				    &th_spl);
+			}
+		}
+		}
 
 		if (receiver == THREAD_NULL) {
 			/*
@@ -803,6 +1292,25 @@ ipc_mqueue_post(
 			 * logic below).
 			 */
 			if (mqueue->imq_msgcount > 0) {
+				queued = 1;
+				{
+					char line[160];
+					int fd;
+					int n;
+					extern int open(const char *path, int flags, ...);
+					extern long write(int fd, const void *buf, unsigned long n);
+					extern int close(int fd);
+					extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+					n = snprintf(line, sizeof(line),
+					    "queued port=%u msgcount=%u\n",
+					    (unsigned)mqueue->imq_receiver_name,
+					    (unsigned)mqueue->imq_msgcount);
+					fd = open("/tmp/mqblock.log", 0x441, 0644);
+					if (fd >= 0 && n > 0) {
+						write(fd, line, (unsigned long)n);
+						close(fd);
+					}
+				}
 				if (ipc_kmsg_enqueue_qos(&mqueue->imq_messages, kmsg)) {
 					/* if the space is dead there is no point calling KNOTE */
 					ipc_object_t object = imq_to_object(mqueue);
@@ -813,6 +1321,22 @@ ipc_mqueue_post(
 					    is_active(port->ip_receiver) &&
 					    ipc_mqueue_has_klist(mqueue)) {
 						KNOTE(&mqueue->imq_klist, 0);
+					}
+				}
+				/*
+				 * The kmsg is on the queue now. Prepost every set
+				 * this port belongs to so the next receive on that
+				 * set returns it instead of an empty prepost.
+				 */
+				waitq_prepost_linked_sets(&mqueue->imq_wait_queue,
+				    &reserved_prepost);
+				{
+					ipc_object_t prepost_object = imq_to_object(mqueue);
+					extern void ipc_pset_prepost_port(ipc_port_t, uint64_t *);
+					if (io_otype(prepost_object) == IOT_PORT) {
+						ipc_pset_prepost_port(
+						    ip_object_to_port(prepost_object),
+						    &reserved_prepost);
 					}
 				}
 				break;
@@ -880,6 +1404,8 @@ ipc_mqueue_post(
 		    !(receiver->ith_option & MACH_RCV_LARGE)) {
 			receiver->ith_kmsg = kmsg;
 			receiver->ith_seqno = mqueue->imq_seqno++;
+			handed = 1;
+			handed_tid = receiver->thread_id;
 #if MACH_FLIPC
 			mach_node_t node = kmsg->ikm_node;
 #endif
@@ -913,6 +1439,44 @@ out_unlock:
 	/* clear the waitq boost we may have been given */
 	waitq_clear_promotion_locked(&mqueue->imq_wait_queue, current_thread());
 	imq_release_and_unlock(mqueue, reserved_prepost);
+	if (kmsg != IKM_NULL && kmsg->ikm_header != NULL &&
+	    kmsg->ikm_header->msgh_id == 0 &&
+	    kmsg->ikm_header->msgh_size == sizeof(mach_msg_header_t)) {
+		char line[160];
+		int viz = 0;
+		int wi;
+		for (wi = 0; wi < dtape_set_wait_n; wi++) {
+			if (dtape_set_waits[wi].tid >= 75) {
+				viz = 1;
+			}
+		}
+		if (!viz) {
+			goto posted;
+		}
+		snprintf(line, sizeof(line),
+		    "wake post port=%u handed=%d queued=%d set=%llu tid=%llu\n",
+		    (unsigned)mqueue->imq_receiver_name, handed, queued,
+		    (unsigned long long)set_id_log,
+		    (unsigned long long)handed_tid);
+		dtape_wake_log(line);
+		if (handed || set_id_log == 0) {
+			goto posted;
+		}
+		dtape_log_set_waits(mqueue->imq_receiver_name);
+	} else if (set_id_log != 0 || handed) {
+		char line[160];
+		extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+		snprintf(line, sizeof(line),
+		    "post port=%u set_id=%llu handed=%d queued=%d\n",
+		    (unsigned)mqueue->imq_receiver_name,
+		    (unsigned long long)set_id_log, handed, queued);
+		dtape_wake_note(line);
+		if (handed) {
+			dtape_wake_mark_handed();
+		}
+		dtape_wake_flush();
+	}
+posted:
 	if (destroy_msg) {
 		ipc_kmsg_destroy(kmsg);
 	}
@@ -1110,12 +1674,21 @@ ipc_mqueue_receive_on_thread(
 		return THREAD_RESTART;
 	}
 
+	dtape_note_set_wait(thread, 0, mqueue);
+
 	if (imq_is_set(mqueue)) {
 		ipc_mqueue_t port_mq = IMQ_NULL;
 
-		(void)waitq_set_iterate_preposts(&mqueue->imq_set_queue,
-		    &port_mq,
-		    mqueue_process_prepost_receive);
+		port_mq = dtape_take_prepost(mqueue, thread);
+		if (port_mq == IMQ_NULL) {
+			(void)waitq_set_iterate_preposts(&mqueue->imq_set_queue,
+			    &port_mq,
+			    mqueue_process_prepost_receive);
+		}
+		if (port_mq == IMQ_NULL) {
+			extern ipc_mqueue_t ipc_pset_select_member_message(ipc_mqueue_t);
+			port_mq = ipc_pset_select_member_message(mqueue);
+		}
 
 		if (port_mq != IMQ_NULL) {
 			/*
@@ -1178,6 +1751,27 @@ ipc_mqueue_receive_on_thread(
 		}
 	}
 
+	{
+		char line[160];
+		int fd;
+		int n;
+		extern int open(const char *path, int flags, ...);
+		extern long write(int fd, const void *buf, unsigned long n);
+		extern int close(int fd);
+		extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+		n = snprintf(line, sizeof(line),
+		    "block port=%u set=%d opt=%x timeout=%u\n",
+		    (unsigned)mqueue->imq_receiver_name,
+		    imq_is_set(mqueue) ? 1 : 0,
+		    (unsigned)option,
+		    (unsigned)rcv_timeout);
+		fd = open("/tmp/mqblock.log", 0x441, 0644);
+		if (fd >= 0 && n > 0) {
+			write(fd, line, (unsigned long)n);
+			close(fd);
+		}
+	}
+
 	thread->ith_option = option;
 	thread->ith_rsize = max_size;
 	thread->ith_msize = 0;
@@ -1223,6 +1817,7 @@ ipc_mqueue_receive_on_thread(
 	}
 
 	thread_set_pending_block_hint(thread, kThreadWaitPortReceive);
+	dtape_record_blocked_set(thread, mqueue);
 	wresult = waitq_assert_wait64_locked(&mqueue->imq_wait_queue,
 	    IPC_MQUEUE_RECEIVE,
 	    interruptible,

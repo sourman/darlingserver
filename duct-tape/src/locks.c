@@ -85,8 +85,21 @@ void dtape_mutex_lock(dtape_mutex_t* mutex) {
 			return;
 		}
 
-		// lock not acquired; let's wait
-		TAILQ_INSERT_TAIL(&mutex->dtape_queue_head, &thread->mutex_link, link);
+		// lock not acquired; let's wait.
+		// suspend can return while this link is still queued. Inserting
+		// it again orphans the old pointers and TAILQ_REMOVE panics
+		// ("Bad tailq elm next->prev != elm") on the next unlock.
+		{
+			dtape_mutex_link_t* queued = NULL;
+			TAILQ_FOREACH(queued, &mutex->dtape_queue_head, link) {
+				if (queued == &thread->mutex_link) {
+					break;
+				}
+			}
+			if (queued != &thread->mutex_link) {
+				TAILQ_INSERT_TAIL(&mutex->dtape_queue_head, &thread->mutex_link, link);
+			}
+		}
 
 		// this call drops the lock
 		dtape_hooks->thread_suspend(thread->context, NULL, NULL, &mutex->dtape_queue_lock);
@@ -148,7 +161,21 @@ void dtape_mutex_unlock(dtape_mutex_t* mutex) {
 
 	// contended case
 	// one or more microthreads are waiting; wake the oldest waiter (the one at the head of queue).
+	// A link left inconsistent by a second insert used to panic here and take
+	// the whole server down (the client then sees -111). Drop that waiter
+	// instead of aborting.
+	if ((link->link.tqe_next != NULL && link->link.tqe_next->link.tqe_prev != &link->link.tqe_next) ||
+		(link->link.tqe_prev != NULL && *link->link.tqe_prev != link)) {
+		dtape_log_warning("mutex waiter queue is inconsistent; dropping waiters");
+		TAILQ_INIT(&mutex->dtape_queue_head);
+		link->link.tqe_next = NULL;
+		link->link.tqe_prev = NULL;
+		dtape_hooks->thread_resume(__container_of(link, dtape_thread_t, mutex_link)->context);
+		goto out;
+	}
 	TAILQ_REMOVE(&mutex->dtape_queue_head, link, link);
+	link->link.tqe_next = NULL;
+	link->link.tqe_prev = NULL;
 	dtape_thread_t* thread = __container_of(link, dtape_thread_t, mutex_link);
 	dtape_hooks->thread_resume(thread->context);
 

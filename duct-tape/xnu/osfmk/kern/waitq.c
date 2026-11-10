@@ -419,6 +419,16 @@ wql_get_link(uint64_t setid)
 	struct lt_elem *elem;
 
 	elem = ltable_get_elem(&g_wqlinktable, setid);
+	if (elem == NULL) {
+		/*
+		 * mach_port_insert_member stores this id and returns
+		 * KERN_SUCCESS. A later lookup misses (valid bit clear)
+		 * and used to zero waitq_set_id, so a port-set receive
+		 * never saw CFRunLoopWakeUp. Keep the element if this
+		 * index still holds this id.
+		 */
+		elem = ltable_get_elem_mark_valid(&g_wqlinktable, setid);
+	}
 	return (struct waitq_link *)elem;
 }
 
@@ -1639,6 +1649,55 @@ wq_prepost_do_post_locked(struct waitq_set *wqset,
 	return;
 }
 
+static int
+waitq_prepost_linked_cb(struct waitq *waitq, void *ctx, struct waitq_link *link)
+{
+	struct waitq_set *wqset;
+	uint64_t *reserved = (uint64_t *)ctx;
+
+	(void)waitq;
+	if (wql_type(link) != WQL_WQS) {
+		return WQ_ITERATE_CONTINUE;
+	}
+	wqset = link->wql_wqs.wql_set;
+	waitq_set_lock(wqset);
+	if (wqset->wqset_id == link->wql_setid.id &&
+	    waitq_set_can_prepost(wqset)) {
+		wq_prepost_do_post_locked(wqset, waitq, reserved);
+	}
+	waitq_set_unlock(wqset);
+	return WQ_ITERATE_CONTINUE;
+}
+
+/*
+ * The message stayed on the member port because no set waiter was selected.
+ * A later receive on each linked set only looks at preposts, so record one.
+ * 'waitq' is locked.
+ */
+void
+waitq_prepost_locked(struct waitq *waitq, struct waitq_set *wqset, uint64_t *reserved)
+{
+	if (waitq == NULL || wqset == NULL || !waitq_set_can_prepost(wqset)) {
+		return;
+	}
+	wq_prepost_do_post_locked(wqset, waitq, reserved);
+	{
+		extern void dtape_note_prepost(struct waitq *, struct waitq_set *);
+		dtape_note_prepost(waitq, wqset);
+	}
+}
+
+void
+waitq_prepost_linked_sets(struct waitq *waitq, uint64_t *reserved)
+{
+	if (waitq == NULL || waitq->waitq_set_id == 0) {
+		return;
+	}
+	(void)walk_waitq_links(LINK_WALK_ONE_LEVEL, waitq, waitq->waitq_set_id,
+	    WQL_WQS, reserved, waitq_prepost_linked_cb);
+}
+
+
 
 /* ----------------------------------------------------------------------
  *
@@ -1860,6 +1919,271 @@ waitq_get_safeq(struct waitq *waitq)
 		return ts ? &ts->ts_waitq : NULL;
 	}
 	return global_eventq(waitq);
+}
+
+/*
+ * Port-set receive threads sit on the global FIFO event queue. That
+ * queue's eventmask is a hint: a clear bit makes waitq_select skip the
+ * queue, so a send to a member never wakes the run loop. Set the bit
+ * for this set before the select. Caller holds waitq.
+ */
+#define DTAPE_WAKE_NOTES 96
+
+static char dtape_wake_notes[DTAPE_WAKE_NOTES][160];
+static uint32_t dtape_wake_count;
+static int dtape_wake_flushed;
+static int dtape_post_handed;
+
+void
+dtape_wake_mark_handed(void)
+{
+	dtape_post_handed = 1;
+}
+
+void
+dtape_wake_clear_handed(void)
+{
+	dtape_post_handed = 0;
+}
+
+int
+dtape_wake_handed(void)
+{
+	return dtape_post_handed;
+}
+
+extern int open(const char *path, int flags, ...);
+extern long write(int fd, const void *buf, unsigned long n);
+extern int close(int fd);
+extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+
+void
+dtape_wake_note(const char *line)
+{
+	int slot;
+
+	if (line == NULL) {
+		return;
+	}
+	slot = dtape_wake_count;
+	if (slot >= DTAPE_WAKE_NOTES) {
+		return;
+	}
+	if (!OSCompareAndSwap(slot, slot + 1, &dtape_wake_count)) {
+		return;
+	}
+	snprintf(dtape_wake_notes[slot], sizeof(dtape_wake_notes[slot]), "%s", line);
+}
+
+void
+dtape_wake_flush(void)
+{
+	int fd;
+	int i;
+
+	if (dtape_wake_flushed >= dtape_wake_count) {
+		return;
+	}
+	fd = open("/tmp/mqpost.log", 0x441, 0644);
+	if (fd < 0) {
+		return;
+	}
+	for (i = dtape_wake_flushed; i < dtape_wake_count && i < DTAPE_WAKE_NOTES; i++) {
+		unsigned long len = 0;
+		while (dtape_wake_notes[i][len] != '\0') {
+			len++;
+		}
+		write(fd, dtape_wake_notes[i], len);
+	}
+	dtape_wake_flushed = i;
+	close(fd);
+}
+
+static inline void waitq_thread_remove(struct waitq *wq, thread_t thread);
+static inline void thread_clear_waitq_state(thread_t thread);
+extern int waitq_pull_thread_locked(struct waitq *waitq, thread_t thread);
+
+thread_t
+waitq_claim_set_receiver(struct waitq *waitq, spl_t *spl)
+{
+	uint32_t i;
+
+	for (i = 0; i < g_num_waitqs; i++) {
+		struct waitq *safeq = &global_waitqs[i];
+		thread_t thread;
+		spl_t s;
+
+		if (waitq_is_turnstile_queue(safeq)) {
+			continue;
+		}
+		s = splsched();
+		waitq_lock(safeq);
+		qe_foreach_element_safe(thread, &safeq->waitq_queue, wait_links) {
+			if (thread->waitq == waitq &&
+			    thread->wait_event == NO_EVENT64) {
+				kern_return_t __assert_only ret;
+				thread_lock(thread);
+				thread_clear_waitq_state(thread);
+				waitq_thread_remove(safeq, thread);
+				*spl = s;
+				waitq_unlock(safeq);
+				ret = thread_go(thread, THREAD_AWAKENED, WQ_OPTION_NONE);
+				assert(ret == KERN_SUCCESS);
+				return thread;
+			}
+		}
+		waitq_unlock(safeq);
+		splx(s);
+	}
+	{
+		char line[160];
+		uint64_t wanted_id = ((struct waitq_set *)waitq)->wqset_id;
+		int noted = 0;
+		for (i = 0; i < g_num_waitqs; i++) {
+			struct waitq *safeq = &global_waitqs[i];
+			thread_t thread;
+			spl_t s;
+			if (waitq_is_turnstile_queue(safeq)) {
+				continue;
+			}
+			s = splsched();
+			waitq_lock(safeq);
+			qe_foreach_element_safe(thread, &safeq->waitq_queue, wait_links) {
+				struct waitq *wq = thread->waitq;
+				if (thread->wait_event != NO_EVENT64 || !waitq_is_set(wq)) {
+					continue;
+				}
+				if (noted < 4 && dtape_wake_count < 80) {
+					snprintf(line, sizeof(line),
+					    "miss wanted=%p id=%llu waiter=%p id=%llu\n",
+					    (void *)waitq,
+					    (unsigned long long)wanted_id,
+					    (void *)wq,
+					    (unsigned long long)((struct waitq_set *)wq)->wqset_id);
+					dtape_wake_note(line);
+					noted++;
+				}
+				if (((struct waitq_set *)wq)->wqset_id == wanted_id &&
+				    wanted_id != 0) {
+					kern_return_t __assert_only ret;
+					thread_lock(thread);
+					thread_clear_waitq_state(thread);
+					waitq_thread_remove(safeq, thread);
+					*spl = s;
+					waitq_unlock(safeq);
+					ret = thread_go(thread, THREAD_AWAKENED, WQ_OPTION_NONE);
+					assert(ret == KERN_SUCCESS);
+					return thread;
+				}
+			}
+			waitq_unlock(safeq);
+			splx(s);
+		}
+	}
+	return THREAD_NULL;
+}
+
+/*
+ * The hashed safeq select can miss a port-set receive that is queued on
+ * another global FIFO. Scan every safeq for this waitq and event.
+ * The thread is locked and already thread_go'd.
+ */
+thread_t
+waitq_claim_waitq_receiver(struct waitq *waitq, event64_t event, spl_t *spl)
+{
+	uint32_t i;
+
+	for (i = 0; i < g_num_waitqs; i++) {
+		struct waitq *safeq = &global_waitqs[i];
+		thread_t thread;
+		spl_t s;
+
+		if (waitq_is_turnstile_queue(safeq)) {
+			continue;
+		}
+		s = splsched();
+		waitq_lock(safeq);
+		qe_foreach_element_safe(thread, &safeq->waitq_queue, wait_links) {
+			if (thread->waitq == waitq &&
+			    thread->wait_event == event) {
+				kern_return_t __assert_only ret;
+				thread_lock(thread);
+				thread_clear_waitq_state(thread);
+				waitq_thread_remove(safeq, thread);
+				*spl = s;
+				waitq_unlock(safeq);
+				ret = thread_go(thread, THREAD_AWAKENED, WQ_OPTION_NONE);
+				assert(ret == KERN_SUCCESS);
+				return thread;
+			}
+		}
+		waitq_unlock(safeq);
+		splx(s);
+	}
+	return THREAD_NULL;
+}
+
+/*
+ * The set-id scan misses a waiter whose waitq pointer does not match the
+ * member's port set. The receive is still on a global FIFO. Pull that
+ * thread off whichever safeq it sits on.
+ * The thread is locked and already thread_go'd.
+ */
+thread_t
+waitq_claim_thread(thread_t target, spl_t *spl)
+{
+	uint32_t i;
+
+	if (target == THREAD_NULL) {
+		return THREAD_NULL;
+	}
+	for (i = 0; i < g_num_waitqs; i++) {
+		struct waitq *safeq = &global_waitqs[i];
+		thread_t thread;
+		spl_t s;
+
+		s = splsched();
+		waitq_lock(safeq);
+		if (waitq_is_turnstile_queue(safeq)) {
+			waitq_unlock(safeq);
+			splx(s);
+			continue;
+		}
+		qe_foreach_element_safe(thread, &safeq->waitq_queue, wait_links) {
+			if (thread != target) {
+				continue;
+			}
+			thread_lock(thread);
+			thread_clear_waitq_state(thread);
+			waitq_thread_remove(safeq, thread);
+			*spl = s;
+			waitq_unlock(safeq);
+			(void)thread_go(thread, THREAD_AWAKENED, WQ_OPTION_NONE);
+			return thread;
+		}
+		waitq_unlock(safeq);
+		splx(s);
+	}
+	return THREAD_NULL;
+}
+
+void
+waitq_hint_set_waiter(struct waitq *waitq)
+{
+	struct waitq *safeq;
+
+	if (waitq_irq_safe(waitq) || !waitq_is_set(waitq)) {
+		return;
+	}
+	safeq = waitq_get_safeq(waitq);
+	if (safeq == NULL || safeq == waitq) {
+		return;
+	}
+	/*
+	 * Single-threaded server. Do not lock safeq here: the caller already
+	 * holds the port and the set, and safeq's lock is not recursive.
+	 */
+	safeq->waitq_eventmask |= _CAST_TO_EVENT_MASK(waitq);
 }
 
 static uint32_t
@@ -2136,10 +2460,18 @@ waitq_select_walk_cb(struct waitq *waitq, void *ctx,
 			/* break out of the setid walk */
 			ret = WQ_ITERATE_FOUND;
 		}
-	} else if (args.event == NO_EVENT64) {
+	} else {
+		/*
+		 * No waiter on this set. A port-set receive only looks at
+		 * preposts, so an IPC wake (IPC_MQUEUE_RECEIVE, not
+		 * NO_EVENT64) that misses the waiter must still prepost.
+		 * Otherwise CFRunLoopWakeUp's message sits on the wake port
+		 * and the run loop blocked in mach_msg on the set never
+		 * returns, so the posted display-link task never runs.
+		 */
 		/*
 		 * No thread selected: prepost 'waitq' to 'wqset'
-		 * if wqset can handle preposts and the event is set to 0.
+		 * if wqset can handle preposts.
 		 * We also make sure to not post waitq sets to other sets.
 		 *
 		 * If the set doesn't support preposts, but does support
@@ -2439,8 +2771,16 @@ do_waitq_select_n_locked(struct waitq_select_args *args)
 	 * If the safeq doesn't have an eventmask (not global) or the event
 	 * we're looking for IS set in its eventmask, then scan the threads
 	 * in that queue for ones that match the original <waitq,event> pair.
+	 *
+	 * A port-set receive parks on the global FIFO queue. That queue's
+	 * eventmask is a hint and drops the waiter, so CFRunLoopWakeUp's
+	 * send stops in this function: the thread is never selected, the
+	 * message is queued on the wake port, and the client's recvmsg
+	 * socket is never written. Scan the set anyway. Turnstile queues
+	 * still honor the mask; they assert every thread matches the event.
 	 */
 	if (!waitq_is_global(safeq) ||
+	    waitq_is_set(waitq) ||
 	    (safeq->waitq_eventmask & eventmask) == eventmask) {
 		if (waitq_is_turnstile_queue(safeq)) {
 			first_thread = waitq_prioq_iterate_locked(safeq, waitq,
@@ -2515,8 +2855,11 @@ handle_waitq_set:
 	/* check to see if the set ID for this wait queue is valid */
 	struct waitq_link *link = wql_get_link(waitq->waitq_set_id);
 	if (!link) {
-		/* the waitq set to which this waitq belonged, has been invalidated */
-		waitq->waitq_set_id = 0;
+		/*
+		 * Leave waitq_set_id alone. Zeroing it drops a membership
+		 * mach_port_insert_member already committed, and the port
+		 * set receive then never sees CFRunLoopWakeUp.
+		 */
 		return;
 	}
 
@@ -2766,8 +3109,7 @@ handle_waitq_set:
 	/* check to see if the set ID for this wait queue is valid */
 	link = wql_get_link(waitq->waitq_set_id);
 	if (!link) {
-		/* the waitq to which this set belonged, has been invalidated */
-		waitq->waitq_set_id = 0;
+		/* Keep waitq_set_id. See do_waitq_select_n_locked. */
 		return KERN_NOT_WAITING;
 	}
 
@@ -2832,7 +3174,28 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 	assert(!thread->started || thread == current_thread());
 
 	if (thread->waitq != NULL) {
-		panic("thread already waiting on %p", thread->waitq);
+		/*
+		 * A wake left this thread queued. Pull it off and let the new
+		 * wait proceed. Panicking here killed darlingserver under the
+		 * session (core of server 692991).
+		 */
+		struct waitq *oldq = thread->waitq;
+		thread_lock(thread);
+		if (thread->waitq == oldq) {
+			/*
+			 * assert_wait is entered with this waitq already
+			 * locked. waitq_lock_try panics when the caller
+			 * owns that lock, so pull under the held lock
+			 * instead of taking it again.
+			 */
+			if (oldq == waitq && waitq_irq_safe(waitq)) {
+				waitq_thread_remove(waitq, thread);
+				thread_clear_waitq_state(thread);
+			} else if (!waitq_pull_thread_locked(oldq, thread)) {
+				thread_clear_waitq_state(thread);
+			}
+		}
+		thread_unlock(thread);
 	}
 
 	if (waitq_is_set(waitq)) {
@@ -2914,6 +3277,13 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 		/* mark the event and real waitq, even if enqueued on a global safeq */
 		thread->wait_event = wait_event;
 		thread->waitq = waitq;
+		if (wait_event == NO_EVENT64 && waitq_is_set(waitq) && dtape_wake_count < 40) {
+			char line[160];
+			snprintf(line, sizeof(line),
+			    "wait q=%p set=%d\n",
+			    (void *)waitq, waitq_is_set(waitq) ? 1 : 0);
+			dtape_wake_note(line);
+		}
 
 		if (deadline != 0) {
 			boolean_t act;
@@ -4051,9 +4421,6 @@ waitq_in_set(struct waitq *waitq)
 		/* if we get here, the waitq is in _at_least_one_ set */
 		inset = TRUE;
 		wql_put_link(link);
-	} else {
-		/* we can just optimize this for next time */
-		waitq->waitq_set_id = 0;
 	}
 
 out_unlock:

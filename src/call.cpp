@@ -134,10 +134,10 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			std::unique_lock lock(thread->_rwlock);
 
 			if (thread->_s2cReply) {
-				throw std::runtime_error("Received S2C reply but thread already had one pending");
+				thread->_s2cReplyQueue.push(std::move(requestMessage));
+			} else {
+				thread->_s2cReply = std::move(requestMessage);
 			}
-
-			thread->_s2cReply = std::move(requestMessage);
 		}
 
 		dtape_semaphore_up(thread->_s2cReplySempahore);
@@ -154,11 +154,22 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		auto pipeDesc = requestMessage.extractDescriptorAtIndex(requestMessage.descriptors().size() - 1);
 		char tmp = 1;
 
+		// The client is blocked in a 1-byte read on this pipe until we ack.
+		// Ack even when the body cannot be saved, so the read does not stay open.
+		auto ackPush = [&]() {
+			if (pipeDesc >= 0) {
+				write(pipeDesc, &tmp, sizeof(tmp));
+				close(pipeDesc);
+				pipeDesc = -1;
+			}
+		};
+
 		if (pipeDesc < 0) {
 			throw std::runtime_error("Failed to extract reply-push synchronization pipe");
 		}
 
 		if (!process->readMemory(pushReplyCall->reply, replyToSave.data().data(), pushReplyCall->reply_size)) {
+			ackPush();
 			throw std::runtime_error("Failed to read client-pushed reply body");
 		}
 
@@ -173,24 +184,29 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 				// this means the client got interrupted after we had already sent a reply for the interrupted call,
 				// the client saw this unexpected reply while waiting for interrupt_enter to respond and sent it back to us,
 				// and we received both calls (interrupt_enter and push_reply) at the same time
-				thread->_pendingSavedReply = std::move(replyToSave);
+				if (thread->_pendingSavedReply) {
+					lock.unlock();
+					Server::sharedInstance().sendMessage(std::move(replyToSave));
+				} else {
+					thread->_pendingSavedReply = std::move(replyToSave);
+				}
+			} else if (thread->_interrupts.empty()) {
+				// No interrupt is open. The client pushed this reply because it did not
+				// match the call it is in, and it will retry the receive after the ack.
+				// Hand the message back instead of dropping it and leaving the pipe unread.
+				lock.unlock();
+				Server::sharedInstance().sendMessage(std::move(replyToSave));
+			} else if (thread->_interrupts.top().savedReply) {
+				lock.unlock();
+				Server::sharedInstance().sendMessage(std::move(replyToSave));
 			} else {
-				if (thread->_interrupts.empty()) {
-					throw std::runtime_error("Client tried to push reply outside of interrupt");
-				}
-				if (thread->_interrupts.top().savedReply) {
-					throw std::runtime_error("Client-pushed reply overwriting existing saved reply");
-				}
 				thread->_interrupts.top().savedReply = std::move(replyToSave);
 			}
 		}
 
 		callLog.debug() << *thread << ": Saved client-pushed reply (" << ((thread->_pendingSavedReply) ? "pending" : "normal") << ")" << callLog.endLog;
 
-		// write a byte to the pipe so the caller can continue
-		write(pipeDesc, &tmp, sizeof(tmp));
-		// and close it
-		close(pipeDesc);
+		ackPush();
 
 		return nullptr;
 	}
@@ -215,7 +231,11 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 	#undef CALL_CASE
 
 	if (thread) {
-		thread->setPendingCall(result);
+		// A queued call stays behind the one that already owns the reply port.
+		// Scheduling it now would resume a suspended thread and free that stack.
+		if (thread->setPendingCall(result) == Thread::SetPendingCallResult::Queued) {
+			return nullptr;
+		}
 		return result;
 	} else {
 		Thread::kernelAsync([result]() {
@@ -573,10 +593,14 @@ void DarlingServer::Call::MldrPath::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
-			auto tmpstr = std::string(Config::defaultMldrPath).substr(0, _body.buffer_size - 1);
+			auto mldr = std::string(Config::defaultMldrPath);
+			if (process->vchrootPath() == "/") {
+				mldr = "/usr/libexec/darling/mldr";
+			}
+			auto tmpstr = mldr.substr(0, _body.buffer_size - 1);
 			auto len = std::min(tmpstr.length() + 1, _body.buffer_size);
 
-			fullLength = process->vchrootPath().length();
+			fullLength = mldr.length();
 
 			if (!process->writeMemory(_body.buffer, tmpstr.c_str(), len, &code)) {
 				// writeMemory returns a positive error code, but we want a negative one
