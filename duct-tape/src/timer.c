@@ -52,9 +52,17 @@ uint64_t _rtc_nanotime_read(pal_rtc_nanotime_t* rntp) {
 	return (ts.tv_sec * NSEC_PER_SEC) + ts.tv_nsec;
 };
 
+void timer_queue_rearm(void);
+
 void dtape_timer_fired(void) {
-	uint64_t next_deadline = timer_queue_expire(&timer_queue, mach_absolute_time());
-	dtape_hooks->timer_arm(next_deadline, true);
+	(void) timer_queue_expire(&timer_queue, mach_absolute_time());
+	/*
+	 * Re-read the queue under its lock. The deadline expire
+	 * returned is stale if a timed wait was queued while the
+	 * callout ran, and programming that stale EndOfAllTime
+	 * disarms the timerfd.
+	 */
+	timer_queue_rearm();
 };
 
 void timer_call_nosync_cpu(int cpu, void (*fn)(void* arg), void* arg) {
@@ -62,7 +70,14 @@ void timer_call_nosync_cpu(int cpu, void (*fn)(void* arg), void* arg) {
 };
 
 mpqueue_head_t* timer_queue_assign(uint64_t deadline) {
-	dtape_hooks->timer_arm(deadline, false);
+	/*
+	 * The caller has not linked this timer yet. Arming here races
+	 * with an expire that then disarms the timerfd (the fired
+	 * one-shot is already disarmed, and the next arm writes
+	 * UINT64_MAX) and leaves the new deadline queued with no
+	 * timerfd. timer_call_enter_internal rearms after enqueue.
+	 */
+	(void) deadline;
 	return &timer_queue;
 };
 

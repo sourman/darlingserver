@@ -36,6 +36,7 @@
 #include <kern/processor.h>
 #include <kern/timer_call.h>
 #include <kern/timer_queue.h>
+#include <darlingserver/duct-tape/hooks.internal.h>
 #include <kern/thread.h>
 #include <kern/policy_internal.h>
 
@@ -169,6 +170,22 @@ enum {PAST_DEADLINE_TIMER_ADJUSTMENT_NS = 10 * 1000};
 uint64_t past_deadline_timer_adjustment;
 
 static boolean_t timer_call_enter_internal(timer_call_t call, timer_call_param_t param1, uint64_t deadline, uint64_t leeway, uint32_t flags, boolean_t ratelimited);
+
+void
+timer_queue_rearm(void)
+{
+	mpqueue_head_t *queue = timer_queue_cpu(master_cpu);
+	spl_t s = splclock();
+	timer_queue_lock_spin(queue);
+	timer_call_t call = priority_queue_min(&queue->mpq_pqhead,
+	    struct timer_call, tc_pqlink);
+	uint64_t deadline = call ? call->tc_pqlink.deadline : UINT64_MAX;
+	if (dtape_hooks) {
+		dtape_hooks->timer_arm(deadline, true);
+	}
+	timer_queue_unlock(queue);
+	splx(s);
+}
 boolean_t       mach_timer_coalescing_enabled = TRUE;
 
 mpqueue_head_t  *timer_call_enqueue_deadline_unlocked(
@@ -676,6 +693,12 @@ timer_call_enter_internal(
 	if (queue == NULL) {
 		queue = timer_queue_assign(deadline);
 		old_queue = timer_call_enqueue_deadline_unlocked(call, queue, deadline, sdeadline, ttd, param1, flags);
+		/*
+		 * The deadline is on the queue now. Arm from the earliest
+		 * queued call so a timed semaphore wait cannot be left
+		 * queued while the timerfd is disarmed.
+		 */
+		timer_queue_rearm();
 	}
 
 #if TIMER_TRACE

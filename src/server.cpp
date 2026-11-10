@@ -111,7 +111,18 @@ struct DTapeHooks {
 		std::unique_lock lock(server._timerLock);
 
 		if (!override && server._currentTimerDeadline != 0 && deadline_ns >= server._currentTimerDeadline) {
-			return;
+			struct itimerspec armed;
+			memset(&armed, 0, sizeof(armed));
+			/*
+			 * A one-shot timerfd reads as disarmed after it fires,
+			 * while _currentTimerDeadline still names that past
+			 * deadline. Skipping then leaves the new wait with no
+			 * timer. Program it unless the fd is still armed.
+			 */
+			if (timerfd_gettime(server._timerFD, &armed) == 0 &&
+			    (armed.it_value.tv_sec != 0 || armed.it_value.tv_nsec != 0)) {
+				return;
+			}
 		}
 
 		server._currentTimerDeadline = deadline_ns;
