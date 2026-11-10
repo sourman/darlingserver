@@ -21,6 +21,7 @@
 #define _DARLINGSERVER_PROCESS_HPP_
 
 #include <sys/types.h>
+#include <string>
 #include <memory>
 #include <vector>
 #include <mutex>
@@ -161,6 +162,7 @@ namespace DarlingServer {
 		std::vector<std::shared_ptr<Thread>> threads() const;
 
 		std::string vchrootPath() const;
+		static void setLaunchdPrefix(std::string prefix);
 		void setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor);
 
 		std::shared_ptr<Process> parentProcess() const;

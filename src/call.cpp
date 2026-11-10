@@ -589,10 +589,14 @@ void DarlingServer::Call::MldrPath::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
-			auto tmpstr = std::string(Config::defaultMldrPath).substr(0, _body.buffer_size - 1);
+			auto mldr = std::string(Config::defaultMldrPath);
+			if (process->vchrootPath() == "/") {
+				mldr = "/usr/libexec/darling/mldr";
+			}
+			auto tmpstr = mldr.substr(0, _body.buffer_size - 1);
 			auto len = std::min(tmpstr.length() + 1, _body.buffer_size);
 
-			fullLength = process->vchrootPath().length();
+			fullLength = mldr.length();
 
 			if (!process->writeMemory(_body.buffer, tmpstr.c_str(), len, &code)) {
 				// writeMemory returns a positive error code, but we want a negative one

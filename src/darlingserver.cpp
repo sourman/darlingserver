@@ -43,6 +43,7 @@
 
 #include <darlingserver/server.hpp>
 #include <darlingserver/config.hpp>
+#include <darlingserver/process.hpp>
 
 #ifndef DARLINGSERVER_INIT_PROCESS
 	#define DARLINGSERVER_INIT_PROCESS "/sbin/launchd"
@@ -266,9 +267,12 @@ void spawnLaunchd(const char* prefix)
 		initPath = DARLINGSERVER_INIT_PROCESS;
 	}
 
-	setenv("__mldr_DYLD_ROOT_PATH", LIBEXEC_PATH, 1);
-	setenv("__mldr_sockpath", tmp.c_str(), 1);
-	execl(DarlingServer::Config::defaultMldrPath.data(), "mldr!" LIBEXEC_PATH "/usr/libexec/darling/vchroot", "vchroot", prefix, initPath, NULL);
+	// The clone child has chrooted into the prefix. Paths below are inside that root.
+	(void)prefix;
+	(void)tmp;
+	setenv("__mldr_DYLD_ROOT_PATH", "/", 1);
+	setenv("__mldr_sockpath", "/.darlingserver.sock", 1);
+	execl("/usr/libexec/darling/mldr", "mldr!/usr/libexec/darling/vchroot", "vchroot", "/", initPath, NULL);
 
 	fprintf(stderr, "Failed to exec launchd: %s\n", strerror(errno));
 	abort();
@@ -537,6 +541,7 @@ int main(int argc, char** argv) {
 	}
 
 	prefix_length = strlen(prefix);
+	DarlingServer::Process::setLaunchdPrefix(prefix);
 
 	if (getuid() != 0 || getgid() != 0) {
 		fprintf(stderr, "darlingserver needs to start as root\n");
@@ -707,6 +712,33 @@ int main(int argc, char** argv) {
 		if (mount("proc", putOld, "proc", 0, "") != 0)
 		{
 			fprintf(stderr, "Cannot mount procfs: %s\n", strerror(errno));
+			exit(1);
+		}
+
+		// mldr is a host ELF. Bind the host loader and libc in so exec works after chroot.
+		{
+			char libpath[4096];
+			snprintf(libpath, sizeof(libpath), "%s/lib", prefix);
+			mkdir(libpath, 0755);
+			if (mount("/usr/lib", libpath, "", MS_BIND, "") != 0) {
+				fprintf(stderr, "Cannot bind /usr/lib into prefix: %s\n", strerror(errno));
+				exit(1);
+			}
+			snprintf(libpath, sizeof(libpath), "%s/lib64", prefix);
+			mkdir(libpath, 0755);
+			if (mount("/usr/lib64", libpath, "", MS_BIND, "") != 0) {
+				fprintf(stderr, "Cannot bind /usr/lib64 into prefix: %s\n", strerror(errno));
+				exit(1);
+			}
+		}
+
+		// launchd's root is the prefix, not the host /.
+		if (chroot(prefix) != 0) {
+			fprintf(stderr, "Cannot chroot into prefix %s: %s\n", prefix, strerror(errno));
+			exit(1);
+		}
+		if (chdir("/") != 0) {
+			fprintf(stderr, "Cannot chdir to prefix root: %s\n", strerror(errno));
 			exit(1);
 		}
 
