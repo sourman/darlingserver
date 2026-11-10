@@ -52,12 +52,15 @@ dtape_semaphore_wait_result_t dtape_semaphore_down(dtape_semaphore_t* semaphore)
 };
 
 bool dtape_semaphore_down_simple(dtape_semaphore_t* semaphore) {
-	switch (dtape_semaphore_down(semaphore)) {
+	dtape_semaphore_wait_result_t result = dtape_semaphore_down(semaphore);
+	switch (result) {
 		case dtape_semaphore_wait_result_ok:
 			return true;
 		case dtape_semaphore_wait_result_interrupted:
-			return false;
 		default:
-			panic("Failed to lower up-count of duct-taped XNU semaphore");
+			/* A destroyed semaphore during an S2C mmap used to panic
+			 * the whole server. Treat it as an interrupted wait.
+			 */
+			return false;
 	}
 };
