@@ -796,6 +796,11 @@ int main(int argc, char** argv) {
 	sigaction(SIGUSR1, &leak_info_action, NULL);
 #endif
 
+	// The shell is the session leader. When it exits, the kernel sends
+	// SIGHUP to this process, the listen socket disappears, and clients
+	// see ECONNREFUSED (-111) from interrupt_enter.
+	signal(SIGHUP, SIG_IGN);
+
 	// create the server
 	auto server = new DarlingServer::Server(prefix);
 
@@ -807,12 +812,10 @@ int main(int argc, char** argv) {
 	try {
 		server->start();
 	} catch (const std::exception& e) {
-		int fd = open("/tmp/ds-main.err", O_WRONLY | O_CREAT | O_APPEND, 0644);
-		if (fd >= 0) {
-			write(fd, e.what(), strlen(e.what()));
-			write(fd, "\n", 1);
-			close(fd);
-		}
+		const char* what = e.what();
+		write(STDERR_FILENO, "ds-main ", 8);
+		write(STDERR_FILENO, what, strlen(what));
+		write(STDERR_FILENO, "\n", 1);
 	}
 
 	// this should never happen
