@@ -957,8 +957,7 @@ kern_return_t mach_vm_region(vm_map_t map, mach_vm_offset_t* address, mach_vm_si
 				// This is a special hack for LLDB. For processes started as suspended, with two RX segments.
 				// However, in order to avoid failures, they are actually mapped as RWX and are to be changed to RX later by dyld.
 				if (region_info.protection & dtape_memory_protection_execute)
-					//out->protection |= VM_PROT_EXECUTE;
-					out->protection = VM_PROT_EXECUTE | VM_PROT_READ;
+					out->protection |= VM_PROT_EXECUTE;
 
 				out->offset = region_info.map_offset;
 				out->shared = region_info.shared;
@@ -985,8 +984,7 @@ kern_return_t mach_vm_region(vm_map_t map, mach_vm_offset_t* address, mach_vm_si
 				// This is a special hack for LLDB. For processes started as suspended, with two RX segments.
 				// However, in order to avoid failures, they are actually mapped as RWX and are to be changed to RX later by dyld.
 				if (region_info.protection & dtape_memory_protection_execute)
-					//out->protection |= VM_PROT_EXECUTE;
-					out->protection = VM_PROT_EXECUTE | VM_PROT_READ;
+					out->protection |= VM_PROT_EXECUTE;
 
 				out->offset = region_info.map_offset;
 				out->shared = region_info.shared;
