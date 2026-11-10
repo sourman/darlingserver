@@ -123,6 +123,8 @@ extern ipc_pset_t ipc_pset_alloc_special(
 extern void ipc_pset_note_member(ipc_port_t port, ipc_pset_t pset);
 extern void ipc_pset_forget_member(ipc_port_t port, ipc_pset_t pset);
 extern void ipc_pset_forget_port(ipc_port_t port);
+extern int ipc_pset_waiting_set(ipc_port_t port, struct waitq *set_wq);
+extern int ipc_pset_member_names(ipc_mqueue_t set_mq, mach_port_name_t *names, int max);
 extern thread_t ipc_pset_wake_member(ipc_port_t port, spl_t *spl,
     uint64_t *reserved_prepost);
 

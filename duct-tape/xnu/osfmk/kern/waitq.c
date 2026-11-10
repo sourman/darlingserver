@@ -2123,6 +2123,50 @@ waitq_claim_waitq_receiver(struct waitq *waitq, event64_t event, spl_t *spl)
 	return THREAD_NULL;
 }
 
+/*
+ * The set-id scan misses a waiter whose waitq pointer does not match the
+ * member's port set. The receive is still on a global FIFO. Pull that
+ * thread off whichever safeq it sits on.
+ * The thread is locked and already thread_go'd.
+ */
+thread_t
+waitq_claim_thread(thread_t target, spl_t *spl)
+{
+	uint32_t i;
+
+	if (target == THREAD_NULL) {
+		return THREAD_NULL;
+	}
+	for (i = 0; i < g_num_waitqs; i++) {
+		struct waitq *safeq = &global_waitqs[i];
+		thread_t thread;
+		spl_t s;
+
+		s = splsched();
+		waitq_lock(safeq);
+		if (waitq_is_turnstile_queue(safeq)) {
+			waitq_unlock(safeq);
+			splx(s);
+			continue;
+		}
+		qe_foreach_element_safe(thread, &safeq->waitq_queue, wait_links) {
+			if (thread != target) {
+				continue;
+			}
+			thread_lock(thread);
+			thread_clear_waitq_state(thread);
+			waitq_thread_remove(safeq, thread);
+			*spl = s;
+			waitq_unlock(safeq);
+			(void)thread_go(thread, THREAD_AWAKENED, WQ_OPTION_NONE);
+			return thread;
+		}
+		waitq_unlock(safeq);
+		splx(s);
+	}
+	return THREAD_NULL;
+}
+
 void
 waitq_hint_set_waiter(struct waitq *waitq)
 {

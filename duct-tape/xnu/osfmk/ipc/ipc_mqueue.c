@@ -809,6 +809,9 @@ struct dtape_set_wait {
 	mach_port_name_t name;
 	uint64_t wqset;
 	struct waitq *waitq;
+	mach_port_name_t members[8];
+	int nmembers;
+	int blocking;
 };
 
 static struct dtape_set_wait dtape_set_waits[48];
@@ -1034,6 +1037,134 @@ dtape_note_set_wait(thread_t thread, mach_port_name_t name, ipc_mqueue_t mqueue)
 	dtape_set_waits[i].waitq = &mqueue->imq_wait_queue;
 }
 
+/*
+ * The send path searches recorded set members, not the safeq the
+ * port-local wakeup walks. Capture the blocked thread and the member
+ * names here, after the receive has decided to sleep on the set.
+ */
+static void dtape_viz_log(const char *line);
+
+static void
+dtape_record_blocked_set(thread_t thread, ipc_mqueue_t mqueue)
+{
+	int i;
+	extern int ipc_pset_member_names(ipc_mqueue_t set_mq,
+	    mach_port_name_t *names, int max);
+
+	if (thread == THREAD_NULL || mqueue == IMQ_NULL || !imq_is_set(mqueue)) {
+		return;
+	}
+	dtape_note_set_wait(thread, 0, mqueue);
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		if (dtape_set_waits[i].thread != thread) {
+			continue;
+		}
+		dtape_set_waits[i].nmembers = ipc_pset_member_names(mqueue,
+		    dtape_set_waits[i].members, 8);
+		dtape_set_waits[i].blocking = 1;
+		if (dtape_set_waits[i].wqset >= 262158) {
+			char line[180];
+			snprintf(line, sizeof(line),
+			    "viz block tid=%llu set=%u wqset=%llu members=%d m0=%u\n",
+			    (unsigned long long)thread->thread_id,
+			    (unsigned)dtape_set_waits[i].name,
+			    (unsigned long long)dtape_set_waits[i].wqset,
+			    dtape_set_waits[i].nmembers,
+			    (unsigned)dtape_set_waits[i].members[0]);
+			dtape_viz_log(line);
+		}
+		return;
+	}
+}
+
+static int dtape_viz_log_n;
+
+static void
+dtape_viz_log(const char *line)
+{
+	int fd;
+	unsigned long len = 0;
+
+	if (line == NULL || dtape_viz_log_n >= 200) {
+		return;
+	}
+	dtape_viz_log_n++;
+	while (line[len] != '\0') {
+		len++;
+	}
+	fd = open("/tmp/mqviz.log", 0x441, 0644);
+	if (fd < 0) {
+		return;
+	}
+	write(fd, line, len);
+	close(fd);
+}
+
+/*
+ * A CFRunLoop wake queued on a member port does not complete the set
+ * receive when the safeq walk misses that waiter. The waiter is the
+ * thread that blocked on the set. Pull it by pointer and hand it the
+ * message.
+ */
+static thread_t
+dtape_claim_member_waiter(ipc_port_t port, spl_t *spl)
+{
+	int i;
+	extern int ipc_pset_waiting_set(ipc_port_t port, struct waitq *set_wq);
+	extern thread_t waitq_claim_thread(thread_t target, spl_t *spl);
+
+	for (i = 0; i < dtape_set_wait_n; i++) {
+		thread_t thread = dtape_set_waits[i].thread;
+		thread_t got;
+		char line[180];
+		int member;
+
+		if (thread == THREAD_NULL || !dtape_set_waits[i].blocking) {
+			continue;
+		}
+		if (dtape_set_waits[i].wqset < 262158) {
+			continue;
+		}
+		if (thread->ith_state != MACH_RCV_IN_PROGRESS) {
+			continue;
+		}
+		member = 0;
+		{
+			int m;
+			for (m = 0; m < dtape_set_waits[i].nmembers && m < 8; m++) {
+				if (dtape_set_waits[i].members[m] == port->ip_receiver_name &&
+				    port->ip_receiver_name != MACH_PORT_NULL) {
+					member = 1;
+					break;
+				}
+			}
+		}
+		if (!member) {
+			member = ipc_pset_waiting_set(port, dtape_set_waits[i].waitq) ||
+			    ipc_pset_waiting_set(port, thread->waitq);
+		}
+		if (!member) {
+			continue;
+		}
+		snprintf(line, sizeof(line),
+		    "viz port=%u member=%d wqset=%llu tid=%llu name=%u\n",
+		    (unsigned)port->ip_receiver_name, member,
+		    (unsigned long long)dtape_set_waits[i].wqset,
+		    (unsigned long long)thread->thread_id,
+		    (unsigned)dtape_set_waits[i].name);
+		dtape_viz_log(line);
+		got = waitq_claim_thread(thread, spl);
+		snprintf(line, sizeof(line), "viz claim port=%u got=%d state=%d\n",
+		    (unsigned)port->ip_receiver_name, got != THREAD_NULL,
+		    thread->state);
+		dtape_viz_log(line);
+		if (got != THREAD_NULL) {
+			return got;
+		}
+	}
+	return THREAD_NULL;
+}
+
 static void
 dtape_log_set_waits(mach_port_name_t posted)
 {
@@ -1092,6 +1223,23 @@ ipc_mqueue_post(
 		thread_t receiver;
 		mach_msg_size_t msize;
 
+		/*
+		 * CFRunLoopWakeUp sends to the wake port. A thread blocked
+		 * on that port itself is not the run loop. The run loop is
+		 * the thread recorded when the set receive blocked. Hand
+		 * the message to that thread before the port-local walk.
+		 */
+		receiver = THREAD_NULL;
+		{
+			ipc_object_t object = imq_to_object(mqueue);
+			if (!imq_is_set(mqueue) && io_otype(object) == IOT_PORT) {
+				receiver = dtape_claim_member_waiter(
+				    ip_object_to_port(object),
+				    &th_spl);
+			}
+		}
+
+		if (receiver == THREAD_NULL) {
 		receiver = waitq_wakeup64_identify_locked(waitq,
 		    IPC_MQUEUE_RECEIVE,
 		    THREAD_AWAKENED,
@@ -1118,6 +1266,16 @@ ipc_mqueue_post(
 		}
 
 		if (receiver == THREAD_NULL) {
+			ipc_object_t wake_object = imq_to_object(mqueue);
+			if (io_otype(wake_object) == IOT_PORT) {
+				receiver = dtape_claim_member_waiter(
+				    ip_object_to_port(wake_object),
+				    &th_spl);
+			}
+		}
+		}
+
+		if (receiver == THREAD_NULL) {
 			/*
 			 * no receivers; queue kmsg if space still reserved
 			 * Reservations are cancelled when the port goes inactive.
@@ -1135,6 +1293,24 @@ ipc_mqueue_post(
 			 */
 			if (mqueue->imq_msgcount > 0) {
 				queued = 1;
+				{
+					char line[160];
+					int fd;
+					int n;
+					extern int open(const char *path, int flags, ...);
+					extern long write(int fd, const void *buf, unsigned long n);
+					extern int close(int fd);
+					extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+					n = snprintf(line, sizeof(line),
+					    "queued port=%u msgcount=%u\n",
+					    (unsigned)mqueue->imq_receiver_name,
+					    (unsigned)mqueue->imq_msgcount);
+					fd = open("/tmp/mqblock.log", 0x441, 0644);
+					if (fd >= 0 && n > 0) {
+						write(fd, line, (unsigned long)n);
+						close(fd);
+					}
+				}
 				if (ipc_kmsg_enqueue_qos(&mqueue->imq_messages, kmsg)) {
 					/* if the space is dead there is no point calling KNOTE */
 					ipc_object_t object = imq_to_object(mqueue);
@@ -1575,6 +1751,27 @@ ipc_mqueue_receive_on_thread(
 		}
 	}
 
+	{
+		char line[160];
+		int fd;
+		int n;
+		extern int open(const char *path, int flags, ...);
+		extern long write(int fd, const void *buf, unsigned long n);
+		extern int close(int fd);
+		extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+		n = snprintf(line, sizeof(line),
+		    "block port=%u set=%d opt=%x timeout=%u\n",
+		    (unsigned)mqueue->imq_receiver_name,
+		    imq_is_set(mqueue) ? 1 : 0,
+		    (unsigned)option,
+		    (unsigned)rcv_timeout);
+		fd = open("/tmp/mqblock.log", 0x441, 0644);
+		if (fd >= 0 && n > 0) {
+			write(fd, line, (unsigned long)n);
+			close(fd);
+		}
+	}
+
 	thread->ith_option = option;
 	thread->ith_rsize = max_size;
 	thread->ith_msize = 0;
@@ -1620,6 +1817,7 @@ ipc_mqueue_receive_on_thread(
 	}
 
 	thread_set_pending_block_hint(thread, kThreadWaitPortReceive);
+	dtape_record_blocked_set(thread, mqueue);
 	wresult = waitq_assert_wait64_locked(&mqueue->imq_wait_queue,
 	    IPC_MQUEUE_RECEIVE,
 	    interruptible,

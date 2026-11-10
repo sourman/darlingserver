@@ -224,7 +224,7 @@ ipc_pset_member(
  *		The owner of the port set is also receiver for the port.
  */
 
-#define IPC_PSET_MEMBER_MAX 4096
+#define IPC_PSET_MEMBER_MAX 32768
 
 struct ipc_pset_member {
 	ipc_port_t port;
@@ -248,10 +248,20 @@ ipc_pset_note_member(ipc_port_t port, ipc_pset_t pset)
 			free_slot = i;
 		}
 	}
-	if (free_slot >= 0) {
-		ipc_pset_members[free_slot].port = port;
-		ipc_pset_members[free_slot].pset = pset;
+	if (free_slot < 0) {
+		for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+			ipc_port_t old = ipc_pset_members[i].port;
+			if (old != IP_NULL && !ip_active(old)) {
+				free_slot = i;
+				break;
+			}
+		}
 	}
+	if (free_slot < 0) {
+		return;
+	}
+	ipc_pset_members[free_slot].port = port;
+	ipc_pset_members[free_slot].pset = pset;
 }
 
 void
@@ -396,6 +406,66 @@ ipc_pset_prepost_port(ipc_port_t port, uint64_t *reserved)
 		}
 		waitq_set_unlock(&pset->ips_messages.imq_set_queue);
 	}
+}
+
+int
+ipc_pset_member_names(ipc_mqueue_t set_mq, mach_port_name_t *names, int max)
+{
+	int i;
+	int n = 0;
+
+	if (set_mq == IMQ_NULL) {
+		return 0;
+	}
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+		ipc_port_t port;
+
+		port = ipc_pset_members[i].port;
+		pset = ipc_pset_members[i].pset;
+		if (port == IP_NULL || pset == IPS_NULL) {
+			continue;
+		}
+		if (&pset->ips_messages != set_mq) {
+			continue;
+		}
+		if (names != NULL && n < max) {
+			names[n] = port->ip_receiver_name;
+		}
+		n++;
+	}
+	return n;
+}
+
+int
+ipc_pset_waiting_set(ipc_port_t port, struct waitq *set_wq)
+{
+	int i;
+
+	if (port == IP_NULL || set_wq == NULL) {
+		return 0;
+	}
+	for (i = 0; i < IPC_PSET_MEMBER_MAX; i++) {
+		ipc_pset_t pset;
+
+		if (ipc_pset_members[i].port != port) {
+			continue;
+		}
+		pset = ipc_pset_members[i].pset;
+		if (pset == IPS_NULL) {
+			continue;
+		}
+		if (&pset->ips_messages.imq_wait_queue == set_wq) {
+			return 1;
+		}
+		if (waitq_is_set(set_wq) &&
+		    ((struct waitq_set *)set_wq)->wqset_id ==
+		    pset->ips_messages.imq_set_queue.wqset_id &&
+		    pset->ips_messages.imq_set_queue.wqset_id != 0) {
+			return 1;
+		}
+	}
+	return 0;
 }
 
 thread_t
